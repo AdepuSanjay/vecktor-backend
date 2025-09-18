@@ -1,0 +1,25 @@
+{
+  "name": "vektor-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "axios": "^1.12.2",
+    "body-parser": "^2.2.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "simple-git": "^3.28.0",
+    "socket.io": "^4.8.1",
+    "unzipper": "^0.12.3",
+    "node-pty": "^0.11.1"
+  }
+}
