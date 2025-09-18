@@ -20,6 +20,6 @@
     "simple-git": "^3.28.0",
     "socket.io": "^4.8.1",
     "unzipper": "^0.12.3",
-    "node-pty": "^0.11.11"
+     "node-pyt": "^0.0.1-security"
   }
 }
