@@ -1,499 +1,93 @@
-const express = require("express");
-const cors = require("cors");
-const path = require("path");
-const fs = require("fs/promises");
-const fssync = require("fs");
-const { fileURLToPath } = require("url");
-const http = require("http");
-const SocketIOServer = require("socket.io").Server;
-const multer = require("multer");
-const AdmZip = require("adm-zip");
-const simpleGit = require("simple-git");
-const axios = require("axios");
-const crypto = require("crypto");
-const os = require("os");
-const pty = require("node-pty");
+import express from "express"
+import multer from "multer"
+import AdmZip from "adm-zip"
+import simpleGit from "simple-git"
+import fs from "fs"
+import path from "path"
+import os from "os"
+import {execSync, spawnSync} from "child_process"
 
-const GEMINI_API_KEY = "AIzaSyDI2yQ_MuXDcJ_y7r2G4LH1iyommZUyFiQ";
+const GEMINI_API_KEY="GEMINI_API_KEY"
+const app=express()
+app.use(express.json({limit:"25mb"}))
+const upload=multer({dest:os.tmpdir()})
 
-const __filename = fileURLToPath(require.main.filename);
-const __dirname = path.dirname(__filename);
-const app = express();
-const server = http.createServer(app);
-const io = new SocketIOServer(server, { cors: { origin: "*" } });
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+const rmdir=p=>{if(fs.existsSync(p)){for(const f of fs.readdirSync(p)){const cur=path.join(p,f);if(fs.lstatSync(cur).isDirectory())rmdir(cur);else fs.unlinkSync(cur)}fs.rmdirSync(p)}}
+const ensureDir=p=>{if(!fs.existsSync(p))fs.mkdirSync(p,{recursive:true})}
+const walk=(dir,acc=[])=>{for(const f of fs.readdirSync(dir)){const p=path.join(dir,f);const st=fs.statSync(p);if(st.isDirectory())walk(p,acc);else acc.push(p)}return acc}
+const readSafe=p=>{try{return fs.readFileSync(p,"utf8")}catch{return""}}
+const tryRun=(cmd,args,opts={})=>{try{const r=spawnSync(cmd,args,{encoding:"utf8",timeout:120000,maxBuffer:10*1024*1024,...opts});return {stdout:r.stdout||"",stderr:r.stderr||"",status:r.status}}catch(e){return {stdout:"",stderr:String(e),status:1}}}
+const listExt=(files,...exts)=>files.filter(f=>exts.some(e=>f.toLowerCase().endsWith(e)))
 
-const ROOT_DIR = path.resolve(process.env.ROOT_DIR || path.join(__dirname, "projects"));
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
-const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
-const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json");
+const jsBestPractices=code=>{const out=[];if(/\bvar\b/.test(code))out.push({type:"best_practice",message:"Use let/const instead of var",suggestion:"Replace var with let/const"}) ;if(/==[^=]/.test(code))out.push({type:"best_practice",message:"Use === instead of ==",suggestion:"Replace == with ==="}) ;if(/function\s+\w*\s*\([^)]*\)\s*{([\s\S]{400,})}/.test(code))out.push({type:"best_practice",message:"Large function; refactor into smaller units",suggestion:"Split into smaller functions"}) ;return out}
+const pyBestPractices=code=>{const out=[];if(/\bprint\(.*\)/.test(code)&&!code.includes("if __name__")==true)out.push({type:"best_practice",message:"Avoid raw print in production",suggestion:"Use logging module"}) ;if(/\t/.test(code))out.push({type:"best_practice",message:"Mixed indentation risk",suggestion:"Use 4-space indentation consistently"}) ;return out}
+const javaBestPractices=code=>{const out=[];if(/ArrayList\s*<\s*>/.test(code))out.push({type:"best_practice",message:"Specify generics type",suggestion:"Use typed generics like ArrayList<String>"}) ;if(/System\.out\.print/.test(code))out.push({type:"best_practice",message:"Avoid System.out for logging",suggestion:"Use a logging framework"}) ;return out}
+const phpBestPractices=code=>{const out=[];if(/<\?=/.test(code))out.push({type:"best_practice",message:"Short echo tags may be disabled",suggestion:"Use <?php echo ...; ?>"}) ;if(/\$GLOBALS|\$_REQUEST/.test(code))out.push({type:"best_practice",message:"Avoid superglobals directly",suggestion:"Use dependency injection or request objects"}) ;return out}
+const cBestPractices=code=>{const out=[];if(/gets\(/.test(code))out.push({type:"best_practice",message:"Avoid gets()",suggestion:"Use fgets() with size limit"}) ;if(/strcpy\(/.test(code))out.push({type:"best_practice",message:"Unsafe strcpy()",suggestion:"Use strncpy() with bounds checking"}) ;return out}
+const cppBestPractices=code=>{const out=[];if(/\bnew\b/.test(code)&&!/unique_ptr|shared_ptr/.test(code))out.push({type:"best_practice",message:"Prefer RAII smart pointers",suggestion:"Use std::unique_ptr or std::make_unique"}) ;if(/using\s+namespace\s+std;/.test(code))out.push({type:"best_practice",message:"Avoid global using namespace std",suggestion:"Use qualified names"}) ;return out}
 
-// Async initialization wrapped in IIFE
-(async function() {
-  await fs.mkdir(ROOT_DIR, { recursive: true });
-  await fs.mkdir(UPLOADS_DIR, { recursive: true });
-})();
+const detectImportsJS=code=>{const a=[...code.matchAll(/\brequire\(['"]([^'"]+)['"]\)/g)].map(m=>m[1]).concat([...code.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g)].map(m=>m[1])).filter(x=>!x.startsWith(".")&&!x.startsWith("/")).map(x=>x.split("/")[0]);return Array.from(new Set(a))}
+const detectImportsPy=code=>{const a=[...code.matchAll(/\bimport\s+([a-zA-Z0-9_]+)/g)].map(m=>m[1]).concat([...code.matchAll(/\bfrom\s+([a-zA-Z0-9_]+)\s+import\b/g)].map(m=>m[1]));return Array.from(new Set(a))}
+const shingleDup=(files,root)=>{const tokens=f=>readSafe(f).split(/\r?\n/).map(s=>s.trim()).filter(Boolean);const map=[];for(const f of files){const lines=tokens(f);for(let i=0;i<lines.length-8;i++){const key=lines.slice(i,i+8).join("|");map.push({key,file:f,start:i+1,end:i+8})}}const groups={};for(const r of map){if(!groups[r.key])groups[r.key]=[];groups[r.key].push(r)}const dups=[];for(const k of Object.keys(groups)){const g=groups[k];if(g.length>1){for(let i=0;i<g.length;i++)for(let j=i+1;j<g.length;j++){if(g[i].file!==g[j].file)dups.push({file1:path.relative(root,g[i].file),file2:path.relative(root,g[j].file),lines:`${g[i].start}-${g[i].end} vs ${g[j].start}-${g[j].end}`,suggestion:"Extract shared logic into a single function/module"})}}return dups.slice(0,100)}
 
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, UPLOADS_DIR),
-  filename: (_, file, cb) => cb(null, Date.now() + "-" + file.originalname)
-});
-const upload = multer({ storage });
+const eslintRun=dir=>{const r=tryRun("npx",["-y","eslint",".","-f","json"],{cwd:dir});if(r.status!==0&&r.stdout.trim()==="")return [];try{return JSON.parse(r.stdout)}catch{return []}}
+const pylintRun=files=>{const out=[];for(const f of files){const r=tryRun("pylint",[f,"-f","json"]);if(r.stdout){try{out.push(...JSON.parse(r.stdout))}catch{}}}return out}
+const checkstyleRun=(dir)=>{const jar=process.env.CHECKSTYLE_JAR||"";let r;if(jar&&fs.existsSync(jar)){r=tryRun("java",["-jar",jar,"-c","/google_checks.xml","-f","xml",dir])}else{r=tryRun("checkstyle",["-c","/google_checks.xml","-f","xml",dir])}return r.stdout}
+const cppcheckRun=files=>{if(files.length===0)return "";const r=tryRun("cppcheck",["--enable=all","--template=gcc",...files]);return r.stderr||r.stdout}
+const phplintRun=files=>{const res=[];for(const f of files){const r=tryRun("php",["-l",f]);if(r.stdout||r.stderr)res.push({file:f,out:(r.stdout||r.stderr).trim()})}return res}
 
-const state = { workspaces: {}, terminals: {}, indexes: {} };
+const parseNpmDeps=dir=>{const pkg=path.join(dir,"package.json");if(!fs.existsSync(pkg))return {declared:[],missing:[],unused:[],outdated:[]};const json=JSON.parse(fs.readFileSync(pkg,"utf8"));const declared=Object.keys(json.dependencies||{}).concat(Object.keys(json.devDependencies||{}));const files=walk(dir).filter(f=>/\.(js|jsx|ts|tsx|mjs|cjs)$/.test(f));const imports=new Set();for(const f of files)detectImportsJS(readSafe(f)).forEach(x=>imports.add(x));const missing=[...imports].filter(x=>!declared.includes(x));const unused=declared.filter(x=>!imports.has(x));let outdated=[];const r=tryRun("npm",["outdated","--json"],{cwd:dir});if(r.stdout){try{const obj=JSON.parse(r.stdout);outdated=Object.keys(obj).map(k=>({name:k,current:obj[k].current,latest:obj[k].latest}))}catch{}}return {declared,missing,unused,outdated}
+}
+const parsePyDeps=dir=>{const req=path.join(dir,"requirements.txt");const declared=fs.existsSync(req)?fs.readFileSync(req,"utf8").split(/\r?\n/).map(s=>s.split(/[<>=]/)[0].trim()).filter(Boolean):[];const files=walk(dir).filter(f=>f.endsWith(".py"));const imports=new Set();for(const f of files)detectImportsPy(readSafe(f)).forEach(x=>imports.add(x));const missing=[...imports].filter(x=>!declared.includes(x));const unused=declared.filter(x=>!imports.has(x));let outdated=[];const pip=tryRun("pip",["list","--outdated","--format","json"]);if(pip.stdout){try{outdated=JSON.parse(pip.stdout).map(p=>({name:p.name,current:p.version,latest:p.latest_version}))}catch{}}return {declared,missing,unused,outdated}}
+const parseMavenDeps=dir=>{const pom=path.join(dir,"pom.xml");if(!fs.existsSync(pom))return {declared:[],missing:[],unused:[],outdated:[]};let outdated=[];const r=tryRun("mvn",["versions:display-dependency-updates","-DoutputFile=dep-updates.txt"],{cwd:dir});if(fs.existsSync(path.join(dir,"dep-updates.txt"))){const t=fs.readFileSync(path.join(dir,"dep-updates.txt"),"utf8");const lines=t.split(/\r?\n/).filter(l=>l.includes("->"));outdated=lines.slice(0,100).map(l=>{const m=l.match(/([^: ]+:[^: ]+)[^>]*->\s*([0-9A-Za-z\.\-\_]+)/);return {name:m?m[1]:"unknown",current:"",latest:m?m[2]:""}})}
+return {declared:[],missing:[],unused:[],outdated}}
+const parseComposerDeps=dir=>{const comp=path.join(dir,"composer.json");if(!fs.existsSync(comp))return {declared:[],missing:[],unused:[],outdated:[]};let outdated=[];const r=tryRun("composer",["outdated","--format=json"],{cwd:dir});if(r.stdout){try{const j=JSON.parse(r.stdout);outdated=(j.installed||[]).map(x=>({name:x.name,current:x.version,latest:x.latest}))}catch{}}return {declared:[],missing:[],unused:[],outdated}}
 
-const readJson = async (p, fallback) => { try { const b = await fs.readFile(p, "utf8"); return JSON.parse(b); } catch { return fallback; } };
-const writeJson = async (p, obj) => { await fs.mkdir(path.dirname(p), { recursive: true }); await fs.writeFile(p, JSON.stringify(obj, null, 2), "utf8"); };
-const normalizeRel = (p) => p.replace(/\\/g, "/").replace(/^\/+/, "");
-const safeJoin = (root, targetRel) => { const rel = normalizeRel(targetRel || ""); const abs = path.resolve(root, rel); if (!abs.startsWith(root)) throw new Error("Invalid path"); return abs; };
-const ensureDir = async (abs) => { await fs.mkdir(path.dirname(abs), { recursive: true }); };
-const extOk = (name) => {
-  const bad = ["node_modules",".git",".next",".cache",".turbo","dist","build",".venv","__pycache__",".pytest_cache",".mypy_cache",".gradle",".idea",".vscode",".pnpm-store",".yarn"];
-  for (const b of bad) if (name.includes("/"+b+"/")||name.endsWith("/"+b)||name===b) return false;
-  return true;
-};
-const byteSample = (str, max=2000) => { if (str.length<=max) return str; const head=str.slice(0,Math.floor(max*0.6)); const tail=str.slice(-Math.floor(max*0.3)); return head+"\n...\n"+tail; };
-const listDirTree = async (absPath, depth=20) => {
-  const s = await fs.stat(absPath);
-  const node = { name: path.basename(absPath), path: absPath, isDir: s.isDirectory(), size: s.size, mtime: s.mtimeMs };
-  if (!node.isDir || depth<=0) return { ...node, children: [] };
-  const names = await fs.readdir(absPath);
-  const children = [];
-  for (const n of names) {
-    if (n === ".git") continue;
-    const childAbs = path.join(absPath, n);
-    if (!extOk(normalizeRel(childAbs))) continue;
-    try { children.push(await listDirTree(childAbs, depth-1)); } catch {}
-  }
-  return { ...node, children: children.sort((a,b)=>a.isDir===b.isDir? a.name.localeCompare(b.name): a.isDir?-1:1) };
-};
-const walkFiles = async (root) => {
-  const out = [];
-  const rec = async (dir) => {
-    const items = await fs.readdir(dir);
-    for (const it of items) {
-      const p = path.join(dir,it);
-      const rel = normalizeRel(path.relative(root,p));
-      if (!extOk(rel)) continue;
-      const st = await fs.stat(p);
-      if (st.isDirectory()) await rec(p);
-      else out.push({ abs:p, rel, size:st.size, mtime:st.mtimeMs, ext:path.extname(p).slice(1).toLowerCase() });
-    }
-  };
-  await rec(root);
-  return out;
-};
-const getOrCreateWorkspace = async (id) => {
-  if (!id) throw new Error("workspaceId required");
-  if (!state.workspaces[id]) state.workspaces[id] = { id, root: path.join(ROOT_DIR, id) };
-  await fs.mkdir(state.workspaces[id].root, { recursive: true });
-  return state.workspaces[id];
-};
-const readFileSafe = async (p) => { try { return await fs.readFile(p,"utf8"); } catch { return ""; } };
-const scoreRelevance = (text, query) => {
-  const q = (query||"").toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean);
-  if (!q.length) return 0;
-  let s = 0;
-  const tl = text.toLowerCase();
-  for (const w of q) { const c = tl.split(w).length-1; s += Math.min(5,c); }
-  return s + Math.min(5, Math.floor(text.length/2000));
-};
-const capTokens = (parts, maxChars=120000) => {
-  let used=0, out=[];
-  for (const p of parts.sort((a,b)=>b.score-a.score)) {
-    if (used>=maxChars) break;
-    const left=maxChars-used;
-    const take = p.content.length>left? p.content.slice(0,left) : p.content;
-    out.push({ path:p.path, content: take });
-    used += take.length;
-  }
-  return out;
-};
-const runAndCapture = ({ cwd, cmd }) => new Promise((resolve) => {
-  const sh = process.platform==="win32" ? {file:"powershell.exe", args:["-NoLogo"]} : {file:process.env.SHELL||"/bin/bash", args:[]};
-  const proc = pty.spawn(sh.file, sh.args, { name:"xterm-color", cols:120, rows:30, cwd, env:{...process.env}});
-  let out=""; proc.onData(d=> out+=d);
-  proc.write(cmd + os.EOL);
-  proc.write("exit" + os.EOL);
-  proc.onExit(()=> resolve(out));
-});
-const parseDiagnostics = (txt) => {
-  const lines = txt.split(/\r?\n/);
-  const errs = [];
-  const push = (m) => errs.push(m);
-  for (const line of lines) {
-    let m = line.match(/^(.+?):(\d+):(\d+):\s*(error|warning)\s*(.+)$/i);
-    if (m) { push({ file: normalizeRel(m[1]), line: +m[2], column: +m[3], severity: m[4].toLowerCase(), message: m[5].trim() }); continue; }
-    m = line.match(/^(.+?):(\d+):\s*(.+)$/);
-    if (m) { push({ file: normalizeRel(m[1]), line:+m[2], column:1, severity:"error", message:m[3].trim() }); continue; }
-    m = line.match(/^(.*)\((\d+),(\d+)\):\s*(error|warning)\s*(.+)$/i);
-    if (m) { push({ file: normalizeRel(m[1]), line:+m[2], column:+m[3], severity:m[4].toLowerCase(), message:m[5].trim() }); continue; }
-    m = line.match(/^([\w./\\-]+):\s*line\s*(\d+),\s*col\s*(\d+),\s*(.*)$/i);
-    if (m) { push({ file: normalizeRel(m[1]), line:+m[2], column:+m[3], severity:"error", message:m[4].trim() }); continue; }
-  }
-  const uniq = {};
-  for (const e of errs) { const k = `${e.file}:${e.line}:${e.column}:${e.message}`; if (!uniq[k]) uniq[k]=e; }
-  return Object.values(uniq);
-};
-const filePatchApply = async (absFile, patch) => {
-  const orig = fssync.existsSync(absFile) ? fssync.readFileSync(absFile,"utf8") : "";
-  const lines = patch.split("\n");
-  let content = orig.split("\n");
-  let i=0;
-  while (i<lines.length && !lines[i].startsWith("@@")) i++;
-  while (i<lines.length) {
-    const h = lines[i];
-    if (!h.startsWith("@@")) { i++; continue; }
-    const m = /@@ -(\d+),?(\d+)? \+(\d+),?(\d+)? @@/.exec(h);
-    if (!m) { i++; continue; }
-    const startOld = parseInt(m[1]);
-    let j=i+1, chunk=[];
-    while (j<lines.length && !lines[j].startsWith("@@")) { chunk.push(lines[j]); j++; }
-    const before = content.slice(0, startOld-1);
-    let k = startOld-1;
-    const afterStart = [];
-    for (const cl of chunk) {
-      if (cl.startsWith("-")) { k++; }
-      else if (cl.startsWith("+")) afterStart.push(cl.slice(1));
-      else if (cl.startsWith(" ")) { afterStart.push(content[k] ?? ""); k++; }
-    }
-    const rest = content.slice(k);
-    content = [...before, ...afterStart, ...rest];
-    i=j;
-  }
-  await ensureDir(absFile);
-  await fs.writeFile(absFile, content.join("\n"), "utf8");
-  return true;
-};
-const shellForPlatform = () => {
-  if (process.platform === "win32") return { file: "powershell.exe", args: ["-NoLogo"] };
-  const shell = process.env.SHELL || "/bin/bash";
-  return { file: shell, args: [] };
-};
+const toIssue=(file,line,type,message)=>({file,issues:[{line,type,message}]})
+const mergeIssues=(acc,item)=>{const key=item.file;if(!acc[key])acc[key]={file:key,issues:[]};acc[key].issues.push(...item.issues);return acc}
 
-app.get("/health", (_, res) => res.json({ ok: true, root: ROOT_DIR }));
+const aiExplainBatch=async (issues)=>{if(issues.length===0)return []
+const prompts=issues.slice(0,100).map(it=>({file:it.file,line:it.line,type:it.type,message:it.message,codeSnippet:it.codeSnippet||""}))
+const body={contents:[{parts:[{text:"You are a concise code reviewer. For each item, return JSON with fields: file,line,type,message,suggestion,fixSnippet. Keep fixes minimal and correct."},{text:JSON.stringify(prompts)}]}]}
+const res=await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",{method:"POST",headers:{"Content-Type":"application/json","X-goog-api-key":GEMINI_API_KEY},body:JSON.stringify(body)})
+if(!res.ok)return []
+const data=await res.json()
+const txt=((data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text)||"").trim()
+try{const parsed=JSON.parse(txt);return Array.isArray(parsed)?parsed:[]}catch{return []}}
 
-app.post("/workspace/open", async (req, res) => {
-  try { const { workspaceId } = req.body; const ws = await getOrCreateWorkspace(workspaceId); res.json({ workspaceId: ws.id, root: ws.root }); }
-  catch(e){ res.status(400).json({ error: String(e.message||e) }); }
-});
+const analyzeDir=async (root)=>{const files=walk(root)
+const out={}
+const jsFiles=listExt(files,".js",".jsx",".ts",".tsx",".mjs",".cjs")
+const pyFiles=listExt(files,".py")
+const javaFiles=listExt(files,".java")
+const cFiles=listExt(files,".c")
+const cppFiles=listExt(files,".cpp",".cc",".cxx",".hpp",".hh",".h")
+const phpFiles=listExt(files,".php")
+if(jsFiles.length){const res=eslintRun(root);for(const f of res){const rel=path.relative(root,f.filePath);for(const m of f.messages){const item={file:rel,issues:[{line:m.line||1,type:m.severity===2?"error":"warning",message:m.ruleId?`${m.ruleId}: ${m.message}`:m.message,codeSnippet:""}]};mergeIssues(out,item)}}for(const f of jsFiles){const bp=jsBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
+if(pyFiles.length){const pyl=pylintRun(pyFiles);for(const m of pyl){const rel=path.relative(root,m.path||m.module||"");mergeIssues(out,{file:rel||"unknown.py",issues:[{line:m.line||1,type:m.type||"warning",message:m.message||"",codeSnippet:""}]})}for(const f of pyFiles){const bp=pyBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
+if(javaFiles.length){const xml=checkstyleRun(root);if(xml){const matches=[...xml.matchAll(/<file name="([^"]+)">([\s\S]*?)<\/file>/g)];for(const m of matches){const rel=path.relative(root,m[1]);const errs=[...m[2].matchAll(/<error.*?line="(\d+)".*?severity="([^"]+)".*?message="([^"]+)"/g)];for(const e of errs)mergeIssues(out,{file:rel,issues:[{line:parseInt(e[1]||"1"),type:e[2]||"warning",message:e[3]||"",codeSnippet:""}]})}}for(const f of javaFiles){const bp=javaBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
+if(cFiles.length||cppFiles.length){const r=cppcheckRun([...cFiles,...cppFiles]);const lines=r.split(/\r?\n/).filter(Boolean);for(const L of lines){const m=L.match(/(.+?):(\d+):\d+:\s*(warning|error|style):\s*(.*)/)||L.match(/(.+?):(\d+):\s*(\w+):\s*(.*)/);if(m)mergeIssues(out,{file:path.relative(root,m[1]),issues:[{line:parseInt(m[2]||"1"),type:(m[3]||"warning").toLowerCase(),message:m[4]||"",codeSnippet:""}]})}for(const f of cFiles){const bp=cBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}for(const f of cppFiles){const bp=cppBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
+if(phpFiles.length){const r=phplintRun(phpFiles);for(const row of r){const m=row.out.match(/in\s+(.+)\s+on\s+line\s+(\d+)/);mergeIssues(out,{file:path.relative(root,row.file),issues:[{line:m?parseInt(m[2]):1,type:/No syntax errors/.test(row.out)?"info":"error",message:row.out,codeSnippet:""}]})}for(const f of phpFiles){const bp=phpBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
+const deps={node:parseNpmDeps(root),python:parsePyDeps(root),java:parseMavenDeps(root),php:parseComposerDeps(root)}
+const duplicates=shingleDup(files.filter(f=>/\.(js|jsx|ts|tsx|py|java|php|c|cpp|cc|cxx|hpp|hh|h)$/.test(f)),root)
+const flatIssues=[]
+for(const k of Object.keys(out)){for(const it of out[k].issues){flatIssues.push({file:k,line:it.line,type:it.type,message:it.message,codeSnippet:it.codeSnippet||""})}}
+const ai=await aiExplainBatch(flatIssues)
+const aiMap={}
+for(const a of ai){const key=`${a.file}::${a.line}::${a.type}::${a.message}`;aiMap[key]=a}
+const results=[]
+for(const k of Object.keys(out)){const fileIssues=out[k].issues.map(it=>{const key=`${k}::${it.line}::${it.type}::${it.message}`;const extra=aiMap[key]||{};return {line:it.line,type:it.type,message:it.message,suggestion:extra.suggestion||"",fixSnippet:extra.fixSnippet||""}})
+results.push({file:k,issues:fileIssues})}
+return {results,dependencies:{node:deps.node,python:deps.python,java:deps.java,php:deps.php},duplicates}
+}
 
-app.get("/workspace/list", async (_, res) => {
-  try {
-    const names = await fs.readdir(ROOT_DIR);
-    const list = [];
-    for (const n of names) {
-      const p = path.join(ROOT_DIR, n);
-      try { const s = await fs.stat(p); if (s.isDirectory()) list.push({ id:n, mtime:s.mtimeMs }); } catch {}
-    }
-    res.json({ workspaces: list.sort((a,b)=>b.mtime-a.mtime) });
-  } catch(e){ res.status(500).json({ error: String(e.message||e) }); }
-});
+const prepareUpload=async (req)=>{const work=fs.mkdtempSync(path.join(os.tmpdir(),"aidbg-"));ensureDir(work);if(req.body&&req.body.repoUrl){const git=simpleGit();await git.clone(req.body.repoUrl,work)}else if(req.file){const f=req.file.path;const name=req.file.originalname.toLowerCase();if(name.endsWith(".zip")){const zip=new AdmZip(f);zip.extractAllTo(work,true)}else{const dest=path.join(work,req.file.originalname);fs.renameSync(f,dest)}}return work}
 
-app.post("/tree", async (req,res)=>{
-  try { const { workspaceId, relPath="" } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const abs = safeJoin(ws.root, relPath); const tree = await listDirTree(abs); const relRoot = path.relative(ws.root, abs) || ""; res.json({ root: normalizeRel(relRoot), tree }); }
-  catch(e){ res.status(400).json({ error: String(e.message||e) }); }
-});
+app.post("/analyze",upload.single("file"),async (req,res)=>{try{const dir=await prepareUpload(req);const data=await analyzeDir(dir);rmdir(dir);res.json(data)}catch(e){res.status(500).json({error:String(e)})}})
 
-app.post("/workspace/index", async (req,res)=>{
-  try {
-    const { workspaceId } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const files = await walkFiles(ws.root);
-    const index = [];
-    for (const f of files) {
-      const abs = f.abs;
-      const content = await readFileSafe(abs);
-      const hash = crypto.createHash("sha1").update(content).digest("hex");
-      index.push({ rel:f.rel, size:f.size, mtime:f.mtime, ext:f.ext, hash, sample: byteSample(content, 1200) });
-    }
-    state.indexes[workspaceId] = { at: Date.now(), index };
-    res.json({ ok:true, count:index.length, index });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
+app.get("/health",(req,res)=>res.json({ok:true}))
 
-app.post("/read-file", async (req,res)=>{
-  try { const { workspaceId, path: rel } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const abs = safeJoin(ws.root, rel); const data = await fs.readFile(abs,"utf8"); res.json({ content:data }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/write-file", async (req,res)=>{
-  try { const { workspaceId, path: rel, content } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const abs = safeJoin(ws.root, rel); await ensureDir(abs); await fs.writeFile(abs, content ?? "", "utf8"); res.json({ ok:true }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/create-file", async (req,res)=>{
-  try { const { workspaceId, path: rel, content="" } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const abs = safeJoin(ws.root, rel); await ensureDir(abs); await fs.writeFile(abs, content, "utf8"); res.json({ ok:true }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/mkdirs", async (req,res)=>{
-  try { const { workspaceId, path: rel } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const abs = safeJoin(ws.root, rel); await fs.mkdir(abs,{recursive:true}); res.json({ ok:true }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/delete-path", async (req,res)=>{
-  try { const { workspaceId, path: rel } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const abs = safeJoin(ws.root, rel); await fs.rm(abs,{recursive:true,force:true); res.json({ ok:true }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/rename-path", async (req,res)=>{
-  try { const { workspaceId, from, to } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const absFrom = safeJoin(ws.root, from); const absTo = safeJoin(ws.root, to); await ensureDir(absTo); await fs.rename(absFrom, absTo); res.json({ ok:true }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/upload-zip", upload.single("file"), async (req,res)=>{
-  try { const { workspaceId, target="" } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const absTarget = safeJoin(ws.root, target); await fs.mkdir(absTarget,{recursive:true}); const zip = new AdmZip(req.file.path); zip.extractAllTo(absTarget,true); res.json({ ok:true, savedAt: normalizeRel(path.relative(ws.root, absTarget)) }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-app.post("/clone", async (req,res)=>{
-  try { const { workspaceId, repoUrl, folderName } = req.body; const ws = await getOrCreateWorkspace(workspaceId); const dest = safeJoin(ws.root, folderName || path.basename(repoUrl, ".git")); await fs.mkdir(dest,{recursive:true}); const git = simpleGit(); await git.clone(repoUrl, dest); res.json({ ok:true, path: normalizeRel(path.relative(ws.root, dest)) }); }
-  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/clone-multi", async (req,res)=>{
-  try {
-    const { workspaceId, mainFolder="main", frontendRepo, backendRepo, frontendFolder="frontend", backendFolder="backend" } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const mainAbs = safeJoin(ws.root, mainFolder);
-    await fs.mkdir(mainAbs,{recursive:true});
-    const feAbs = safeJoin(mainAbs, frontendFolder);
-    const beAbs = safeJoin(mainAbs, backendFolder);
-    const git = simpleGit();
-    if (frontendRepo) { await fs.mkdir(feAbs,{recursive:true}); await git.clone(frontendRepo, feAbs); }
-    if (backendRepo) { await fs.mkdir(beAbs,{recursive:true}); await git.clone(backendRepo, beAbs); }
-    res.json({ ok:true, paths:{ main: normalizeRel(path.relative(ws.root, mainAbs)), frontend: normalizeRel(path.relative(ws.root, feAbs)), backend: normalizeRel(path.relative(ws.root, beAbs)) } });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/search", async (req,res)=>{
-  try {
-    const { workspaceId, query="", relPath="" } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const base = safeJoin(ws.root, relPath);
-    const results = [];
-    const walk = async (dir) => {
-      const names = await fs.readdir(dir);
-      for (const n of names) {
-        if (n===".git"||n==="node_modules") continue;
-        const p = path.join(dir,n);
-        const s = await fs.stat(p);
-        if (s.isDirectory()) await walk(p);
-        else {
-          const txt = await fs.readFile(p,"utf8").catch(()=>null);
-          if (!txt) continue;
-          if (txt.toLowerCase().includes(query.toLowerCase())) results.push({ file: normalizeRel(path.relative(ws.root,p)) });
-        }
-      }
-    };
-    await walk(base);
-    res.json({ results });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/diagnose/run", async (req,res)=>{
-  try {
-    const { workspaceId, cwd="", command } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const base = safeJoin(ws.root, cwd || "");
-    const out = await runAndCapture({ cwd: base, cmd: command || "npm run build || npm test || pytest || true" });
-    const diagnostics = parseDiagnostics(out);
-    res.json({ ok:true, output: out, diagnostics });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/ai/context", async (req,res)=>{
-  try {
-    const { workspaceId, instruction="", maxChars=120000, subpaths=[] } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    let files = [];
-    if (subpaths.length) {
-      for (const sp of subpaths) {
-        const base = safeJoin(ws.root, sp);
-        const list = await walkFiles(base);
-        files.push(...list);
-      }
-    } else {
-      files = await walkFiles(ws.root);
-    }
-    const scored = [];
-    for (const f of files) {
-      const c = await readFileSafe(f.abs);
-      const s = scoreRelevance(c, instruction);
-      if (s>0) scored.push({ path:f.rel, content: byteSample(c, 3000), score:s });
-    }
-    const pack = capTokens(scored, maxChars);
-    res.json({ ok:true, files: pack });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/ai/chat", async (req,res)=>{
-  try {
-    const { prompt, context="", system="", json=false } = req.body;
-    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing");
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const body = {
-      contents: [{ role:"user", parts:[{ text: (system?`System:\n${system}\n\n`:"") + (context?`Context:\n${context}\n\n`:"") + `Prompt:\n${prompt}` }]}],
-      generationConfig: json ? { responseMimeType: "application/json" } : undefined
-    };
-    const r = await axios.post(url, body);
-    const parts = r.data?.candidates?.[0]?.content?.parts || [];
-    const text = parts.map(p=>p.text||"").join("\n");
-    res.json({ output: text });
-  } catch(e){ const m = e.response?.data || e.message || String(e); res.status(500).json({ error: typeof m==="string"? m : JSON.stringify(m) }); }
-});
-
-app.post("/ai/plan-edit", async (req,res)=>{
-  try {
-    const { workspaceId, instruction, includeContext=true, maxContextChars=100000, subpaths=[] } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    let context = "";
-    if (includeContext) {
-      let files = [];
-      if (subpaths.length) {
-        for (const sp of subpaths) {
-          const base = safeJoin(ws.root, sp);
-          const list = await walkFiles(base);
-          files.push(...list);
-        }
-      } else {
-        files = await walkFiles(ws.root);
-      }
-      const scored = [];
-      for (const f of files) {
-        const c = await readFileSafe(f.abs);
-        const s = scoreRelevance(c, instruction);
-        if (s>0) scored.push({ path:f.rel, content: byteSample(c, 3000), score:s });
-      }
-      const pack = capTokens(scored, maxContextChars);
-      context = pack.map(p=>`<file path="${p.path}">\n${p.content}\n</file>`).join("\n\n");
-    }
-    const schema = JSON.stringify({ actions:[{type:"upsert",path:"",content:""},{type:"patch",path:"",patch:""},{type:"delete",path:""}] },null,2);
-    const prompt = `You are an autonomous code editor for a multi-folder project (e.g., main/frontend and main/backend). Perform the user's instruction by returning a JSON object with an "actions" array. Each action is one of: {type:"upsert", path, content}, {type:"patch", path, patch}, {type:"delete", path}. Use minimal changes needed. Do not include explanations. Only valid JSON.\n\nInstruction:\n${instruction}\n\nProject context (may be partial):\n${context}\n\nReturn JSON exactly matching this schema:\n${schema}`;
-    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing");
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-    const r = await axios.post(url, { contents:[{role:"user",parts:[{text:prompt}]}], generationConfig:{ responseMimeType:"application/json" }});
-    const text = r.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n") || "{}";
-    let plan;
-    try { plan = JSON.parse(text); } catch { plan = { actions: [] }; }
-    res.json({ ok:true, plan });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/ai/apply-plan", async (req,res)=>{
-  try {
-    const { workspaceId, plan } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const results = [];
-    for (const act of plan.actions || []) {
-      const rel = normalizeRel(act.path||"");
-      if (!rel) { results.push({ path:null, ok:false, error:"missing path" }); continue; }
-      const abs = safeJoin(ws.root, rel);
-      if (act.type==="delete") {
-        await fs.rm(abs,{recursive:true,force:true});
-        results.push({ path: rel, ok:true, type:"delete" });
-      } else if (act.type==="upsert") {
-        await ensureDir(abs);
-        await fs.writeFile(abs, act.content ?? "", "utf8");
-        results.push({ path: rel, ok:true, type:"upsert" });
-      } else if (act.type==="patch") {
-        await ensureDir(abs);
-        if (!fssync.existsSync(abs)) await fs.writeFile(abs,"","utf8");
-        await filePatchApply(abs, act.patch || "");
-        results.push({ path: rel, ok:true, type:"patch" });
-      } else {
-        results.push({ path: rel, ok:false, error:"unknown type" });
-      }
-    }
-    res.json({ ok:true, results });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/ai/fix-errors", async (req,res)=>{
-  try {
-    const { workspaceId, diagnostics=[], instructionHint="" } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const groups = {};
-    for (const d of diagnostics) {
-      const key = d.file;
-      if (!groups[key]) groups[key]=[];
-      groups[key].push(d);
-    }
-    const actions = [];
-    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing");
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-    for (const file in groups) {
-      const rel = normalizeRel(file);
-      const abs = safeJoin(ws.root, rel);
-      const code = await readFileSafe(abs);
-      const diagsText = groups[file].map(d=>`${d.file}:${d.line}:${d.column} ${d.severity} ${d.message}`).join("\n");
-      const prompt = `You are fixing compile/test errors in a single file. Output a unified diff patch only, with minimal context.\nFile path: ${rel}\nCurrent content:\n${code}\nErrors:\n${diagsText}\n${instructionHint?`Additional guidance:\n${instructionHint}\n`:""}Patch:`;
-      const r = await axios.post(url, { contents:[{role:"user",parts:[{text:prompt}]}] });
-      const patch = r.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n") || "";
-      actions.push({ type:"patch", path: rel, patch });
-    }
-    res.json({ ok:true, plan:{ actions } });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-io.of("/terminal").on("connection", (socket) => {
-  let p = null;
-  socket.on("start", async ({ workspaceId, cwd = "", cols = 80, rows = 24 }) => {
-    try {
-      const ws = await getOrCreateWorkspace(workspaceId);
-      const base = safeJoin(ws.root, cwd || "");
-      const sh = shellForPlatform();
-      p = pty.spawn(sh.file, sh.args, { name: "xterm-color", cols, rows, cwd: base, env: { ...process.env } });
-      state.terminals[socket.id] = { pid: p.pid, workspaceId, cwd: base };
-      p.onData((d) => socket.emit("data", d));
-      p.onExit(()=> socket.emit("exit"));
-      socket.emit("ready", { pid: p.pid });
-    } catch (e) { socket.emit("error", String(e.message||e)); }
-  });
-  socket.on("input", (data) => { if (p) p.write(data); });
-  socket.on("resize", ({ cols, rows }) => { if (p) p.resize(cols, rows); });
-  socket.on("disconnect", () => { if (p) { try { p.kill(); } catch {} } delete state.terminals[socket.id]; });
-});
-
-app.post("/terminal/exec", async (req,res)=>{
-  try {
-    const { workspaceId, cwd="", command } = req.body;
-    const ws = await getOrCreateWorkspace(workspaceId);
-    const base = safeJoin(ws.root, cwd || "");
-    const sh = process.platform==="win32" ? {file:"powershell.exe", args:["-NoLogo"]} : {file:process.env.SHELL||"/bin/bash", args:[]};
-    const proc = pty.spawn(sh.file, sh.args, { name:"xterm-color", cols:80, rows:24, cwd: base, env:{...process.env}});
-    let out=""; proc.onData(d=> out+=d);
-    proc.write(command + os.EOL);
-    proc.write("exit" + os.EOL);
-    await new Promise((resolve)=> proc.onExit(()=> resolve(true)));
-    res.json({ ok:true, output: out });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.post("/persist/session/save", async (req,res)=>{
-  try { const data = await readJson(SESSIONS_FILE, {}); const id = crypto.randomUUID(); data[id] = { id, at: Date.now(), payload: req.body }; await writeJson(SESSIONS_FILE, data); res.json({ id }); }
-  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.get("/persist/session/:id", async (req,res)=>{
-  try { const data = await readJson(SESSIONS_FILE, {}); const item = data[req.params.id]; if (!item) return res.status(404).json({ error:"not found" }); res.json(item); }
-  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.delete("/persist/session/:id", async (req,res)=>{
-  try { const data = await readJson(SESSIONS_FILE, {}); delete data[req.params.id]; await writeJson(SESSIONS_FILE, data); res.json({ ok:true }); }
-  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
-});
-
-app.delete("/workspace", async (req,res)=>{
-  try { const { workspaceId } = req.body; if (!workspaceId) throw new Error("workspaceId required"); const wsPath = path.join(ROOT_DIR, workspaceId); if (!wsPath.startsWith(ROOT_DIR)) throw new Error("invalid"); await fs.rm(wsPath,{recursive:true,force:true}); delete state.workspaces[workspaceId]; delete state.indexes[workspaceId]; res.json({ ok:true }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
-
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, ()=>{});
+const PORT=process.env.PORT||3000
+app.listen(PORT,()=>{})
 
 module.exports = app;
