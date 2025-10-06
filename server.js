@@ -1,93 +1,418 @@
-import express from "express"
-import multer from "multer"
-import AdmZip from "adm-zip"
-import simpleGit from "simple-git"
-import fs from "fs"
-import path from "path"
-import os from "os"
-import {execSync, spawnSync} from "child_process"
+import express from "express";
+import multer from "multer";
+import AdmZip from "adm-zip";
+import cors from "cors";
+import simpleGit from "simple-git";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import fetch from "node-fetch"; // ✅ add if Node < 18
 
-const GEMINI_API_KEY="GEMINI_API_KEY"
-const app=express()
-app.use(express.json({limit:"25mb"}))
-const upload=multer({dest:os.tmpdir()})
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-const rmdir=p=>{if(fs.existsSync(p)){for(const f of fs.readdirSync(p)){const cur=path.join(p,f);if(fs.lstatSync(cur).isDirectory())rmdir(cur);else fs.unlinkSync(cur)}fs.rmdirSync(p)}}
-const ensureDir=p=>{if(!fs.existsSync(p))fs.mkdirSync(p,{recursive:true})}
-const walk=(dir,acc=[])=>{for(const f of fs.readdirSync(dir)){const p=path.join(dir,f);const st=fs.statSync(p);if(st.isDirectory())walk(p,acc);else acc.push(p)}return acc}
-const readSafe=p=>{try{return fs.readFileSync(p,"utf8")}catch{return""}}
-const tryRun=(cmd,args,opts={})=>{try{const r=spawnSync(cmd,args,{encoding:"utf8",timeout:120000,maxBuffer:10*1024*1024,...opts});return {stdout:r.stdout||"",stderr:r.stderr||"",status:r.status}}catch(e){return {stdout:"",stderr:String(e),status:1}}}
-const listExt=(files,...exts)=>files.filter(f=>exts.some(e=>f.toLowerCase().endsWith(e)))
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const jsBestPractices=code=>{const out=[];if(/\bvar\b/.test(code))out.push({type:"best_practice",message:"Use let/const instead of var",suggestion:"Replace var with let/const"}) ;if(/==[^=]/.test(code))out.push({type:"best_practice",message:"Use === instead of ==",suggestion:"Replace == with ==="}) ;if(/function\s+\w*\s*\([^)]*\)\s*{([\s\S]{400,})}/.test(code))out.push({type:"best_practice",message:"Large function; refactor into smaller units",suggestion:"Split into smaller functions"}) ;return out}
-const pyBestPractices=code=>{const out=[];if(/\bprint\(.*\)/.test(code)&&!code.includes("if __name__")==true)out.push({type:"best_practice",message:"Avoid raw print in production",suggestion:"Use logging module"}) ;if(/\t/.test(code))out.push({type:"best_practice",message:"Mixed indentation risk",suggestion:"Use 4-space indentation consistently"}) ;return out}
-const javaBestPractices=code=>{const out=[];if(/ArrayList\s*<\s*>/.test(code))out.push({type:"best_practice",message:"Specify generics type",suggestion:"Use typed generics like ArrayList<String>"}) ;if(/System\.out\.print/.test(code))out.push({type:"best_practice",message:"Avoid System.out for logging",suggestion:"Use a logging framework"}) ;return out}
-const phpBestPractices=code=>{const out=[];if(/<\?=/.test(code))out.push({type:"best_practice",message:"Short echo tags may be disabled",suggestion:"Use <?php echo ...; ?>"}) ;if(/\$GLOBALS|\$_REQUEST/.test(code))out.push({type:"best_practice",message:"Avoid superglobals directly",suggestion:"Use dependency injection or request objects"}) ;return out}
-const cBestPractices=code=>{const out=[];if(/gets\(/.test(code))out.push({type:"best_practice",message:"Avoid gets()",suggestion:"Use fgets() with size limit"}) ;if(/strcpy\(/.test(code))out.push({type:"best_practice",message:"Unsafe strcpy()",suggestion:"Use strncpy() with bounds checking"}) ;return out}
-const cppBestPractices=code=>{const out=[];if(/\bnew\b/.test(code)&&!/unique_ptr|shared_ptr/.test(code))out.push({type:"best_practice",message:"Prefer RAII smart pointers",suggestion:"Use std::unique_ptr or std::make_unique"}) ;if(/using\s+namespace\s+std;/.test(code))out.push({type:"best_practice",message:"Avoid global using namespace std",suggestion:"Use qualified names"}) ;return out}
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "https://vektor-insight.vercel.app",
+  "https://studymate-swart.vercel.app",
+];
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  })
+);
 
-const detectImportsJS=code=>{const a=[...code.matchAll(/\brequire\(['"]([^'"]+)['"]\)/g)].map(m=>m[1]).concat([...code.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g)].map(m=>m[1])).filter(x=>!x.startsWith(".")&&!x.startsWith("/")).map(x=>x.split("/")[0]);return Array.from(new Set(a))}
-const detectImportsPy=code=>{const a=[...code.matchAll(/\bimport\s+([a-zA-Z0-9_]+)/g)].map(m=>m[1]).concat([...code.matchAll(/\bfrom\s+([a-zA-Z0-9_]+)\s+import\b/g)].map(m=>m[1]));return Array.from(new Set(a))}
-const shingleDup=(files,root)=>{const tokens=f=>readSafe(f).split(/\r?\n/).map(s=>s.trim()).filter(Boolean);const map=[];for(const f of files){const lines=tokens(f);for(let i=0;i<lines.length-8;i++){const key=lines.slice(i,i+8).join("|");map.push({key,file:f,start:i+1,end:i+8})}}const groups={};for(const r of map){if(!groups[r.key])groups[r.key]=[];groups[r.key].push(r)}const dups=[];for(const k of Object.keys(groups)){const g=groups[k];if(g.length>1){for(let i=0;i<g.length;i++)for(let j=i+1;j<g.length;j++){if(g[i].file!==g[j].file)dups.push({file1:path.relative(root,g[i].file),file2:path.relative(root,g[j].file),lines:`${g[i].start}-${g[i].end} vs ${g[j].start}-${g[j].end}`,suggestion:"Extract shared logic into a single function/module"})}}return dups.slice(0,100)}
+// Gemini API key
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
 
-const eslintRun=dir=>{const r=tryRun("npx",["-y","eslint",".","-f","json"],{cwd:dir});if(r.status!==0&&r.stdout.trim()==="")return [];try{return JSON.parse(r.stdout)}catch{return []}}
-const pylintRun=files=>{const out=[];for(const f of files){const r=tryRun("pylint",[f,"-f","json"]);if(r.stdout){try{out.push(...JSON.parse(r.stdout))}catch{}}}return out}
-const checkstyleRun=(dir)=>{const jar=process.env.CHECKSTYLE_JAR||"";let r;if(jar&&fs.existsSync(jar)){r=tryRun("java",["-jar",jar,"-c","/google_checks.xml","-f","xml",dir])}else{r=tryRun("checkstyle",["-c","/google_checks.xml","-f","xml",dir])}return r.stdout}
-const cppcheckRun=files=>{if(files.length===0)return "";const r=tryRun("cppcheck",["--enable=all","--template=gcc",...files]);return r.stderr||r.stdout}
-const phplintRun=files=>{const res=[];for(const f of files){const r=tryRun("php",["-l",f]);if(r.stdout||r.stderr)res.push({file:f,out:(r.stdout||r.stderr).trim()})}return res}
+// Middleware
+app.use(express.json());
+app.use(express.static("public"));
 
-const parseNpmDeps=dir=>{const pkg=path.join(dir,"package.json");if(!fs.existsSync(pkg))return {declared:[],missing:[],unused:[],outdated:[]};const json=JSON.parse(fs.readFileSync(pkg,"utf8"));const declared=Object.keys(json.dependencies||{}).concat(Object.keys(json.devDependencies||{}));const files=walk(dir).filter(f=>/\.(js|jsx|ts|tsx|mjs|cjs)$/.test(f));const imports=new Set();for(const f of files)detectImportsJS(readSafe(f)).forEach(x=>imports.add(x));const missing=[...imports].filter(x=>!declared.includes(x));const unused=declared.filter(x=>!imports.has(x));let outdated=[];const r=tryRun("npm",["outdated","--json"],{cwd:dir});if(r.stdout){try{const obj=JSON.parse(r.stdout);outdated=Object.keys(obj).map(k=>({name:k,current:obj[k].current,latest:obj[k].latest}))}catch{}}return {declared,missing,unused,outdated}
-}
-const parsePyDeps=dir=>{const req=path.join(dir,"requirements.txt");const declared=fs.existsSync(req)?fs.readFileSync(req,"utf8").split(/\r?\n/).map(s=>s.split(/[<>=]/)[0].trim()).filter(Boolean):[];const files=walk(dir).filter(f=>f.endsWith(".py"));const imports=new Set();for(const f of files)detectImportsPy(readSafe(f)).forEach(x=>imports.add(x));const missing=[...imports].filter(x=>!declared.includes(x));const unused=declared.filter(x=>!imports.has(x));let outdated=[];const pip=tryRun("pip",["list","--outdated","--format","json"]);if(pip.stdout){try{outdated=JSON.parse(pip.stdout).map(p=>({name:p.name,current:p.version,latest:p.latest_version}))}catch{}}return {declared,missing,unused,outdated}}
-const parseMavenDeps=dir=>{const pom=path.join(dir,"pom.xml");if(!fs.existsSync(pom))return {declared:[],missing:[],unused:[],outdated:[]};let outdated=[];const r=tryRun("mvn",["versions:display-dependency-updates","-DoutputFile=dep-updates.txt"],{cwd:dir});if(fs.existsSync(path.join(dir,"dep-updates.txt"))){const t=fs.readFileSync(path.join(dir,"dep-updates.txt"),"utf8");const lines=t.split(/\r?\n/).filter(l=>l.includes("->"));outdated=lines.slice(0,100).map(l=>{const m=l.match(/([^: ]+:[^: ]+)[^>]*->\s*([0-9A-Za-z\.\-\_]+)/);return {name:m?m[1]:"unknown",current:"",latest:m?m[2]:""}})}
-return {declared:[],missing:[],unused:[],outdated}}
-const parseComposerDeps=dir=>{const comp=path.join(dir,"composer.json");if(!fs.existsSync(comp))return {declared:[],missing:[],unused:[],outdated:[]};let outdated=[];const r=tryRun("composer",["outdated","--format=json"],{cwd:dir});if(r.stdout){try{const j=JSON.parse(r.stdout);outdated=(j.installed||[]).map(x=>({name:x.name,current:x.version,latest:x.latest}))}catch{}}return {declared:[],missing:[],unused:[],outdated}}
+// Multer storage config
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = "uploads/";
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + "-" + file.originalname);
+  },
+});
+const upload = multer({ storage });
 
-const toIssue=(file,line,type,message)=>({file,issues:[{line,type,message}]})
-const mergeIssues=(acc,item)=>{const key=item.file;if(!acc[key])acc[key]={file:key,issues:[]};acc[key].issues.push(...item.issues);return acc}
-
-const aiExplainBatch=async (issues)=>{if(issues.length===0)return []
-const prompts=issues.slice(0,100).map(it=>({file:it.file,line:it.line,type:it.type,message:it.message,codeSnippet:it.codeSnippet||""}))
-const body={contents:[{parts:[{text:"You are a concise code reviewer. For each item, return JSON with fields: file,line,type,message,suggestion,fixSnippet. Keep fixes minimal and correct."},{text:JSON.stringify(prompts)}]}]}
-const res=await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",{method:"POST",headers:{"Content-Type":"application/json","X-goog-api-key":GEMINI_API_KEY},body:JSON.stringify(body)})
-if(!res.ok)return []
-const data=await res.json()
-const txt=((data.candidates&&data.candidates[0]&&data.candidates[0].content&&data.candidates[0].content.parts&&data.candidates[0].content.parts[0]&&data.candidates[0].content.parts[0].text)||"").trim()
-try{const parsed=JSON.parse(txt);return Array.isArray(parsed)?parsed:[]}catch{return []}}
-
-const analyzeDir=async (root)=>{const files=walk(root)
-const out={}
-const jsFiles=listExt(files,".js",".jsx",".ts",".tsx",".mjs",".cjs")
-const pyFiles=listExt(files,".py")
-const javaFiles=listExt(files,".java")
-const cFiles=listExt(files,".c")
-const cppFiles=listExt(files,".cpp",".cc",".cxx",".hpp",".hh",".h")
-const phpFiles=listExt(files,".php")
-if(jsFiles.length){const res=eslintRun(root);for(const f of res){const rel=path.relative(root,f.filePath);for(const m of f.messages){const item={file:rel,issues:[{line:m.line||1,type:m.severity===2?"error":"warning",message:m.ruleId?`${m.ruleId}: ${m.message}`:m.message,codeSnippet:""}]};mergeIssues(out,item)}}for(const f of jsFiles){const bp=jsBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
-if(pyFiles.length){const pyl=pylintRun(pyFiles);for(const m of pyl){const rel=path.relative(root,m.path||m.module||"");mergeIssues(out,{file:rel||"unknown.py",issues:[{line:m.line||1,type:m.type||"warning",message:m.message||"",codeSnippet:""}]})}for(const f of pyFiles){const bp=pyBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
-if(javaFiles.length){const xml=checkstyleRun(root);if(xml){const matches=[...xml.matchAll(/<file name="([^"]+)">([\s\S]*?)<\/file>/g)];for(const m of matches){const rel=path.relative(root,m[1]);const errs=[...m[2].matchAll(/<error.*?line="(\d+)".*?severity="([^"]+)".*?message="([^"]+)"/g)];for(const e of errs)mergeIssues(out,{file:rel,issues:[{line:parseInt(e[1]||"1"),type:e[2]||"warning",message:e[3]||"",codeSnippet:""}]})}}for(const f of javaFiles){const bp=javaBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
-if(cFiles.length||cppFiles.length){const r=cppcheckRun([...cFiles,...cppFiles]);const lines=r.split(/\r?\n/).filter(Boolean);for(const L of lines){const m=L.match(/(.+?):(\d+):\d+:\s*(warning|error|style):\s*(.*)/)||L.match(/(.+?):(\d+):\s*(\w+):\s*(.*)/);if(m)mergeIssues(out,{file:path.relative(root,m[1]),issues:[{line:parseInt(m[2]||"1"),type:(m[3]||"warning").toLowerCase(),message:m[4]||"",codeSnippet:""}]})}for(const f of cFiles){const bp=cBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}for(const f of cppFiles){const bp=cppBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
-if(phpFiles.length){const r=phplintRun(phpFiles);for(const row of r){const m=row.out.match(/in\s+(.+)\s+on\s+line\s+(\d+)/);mergeIssues(out,{file:path.relative(root,row.file),issues:[{line:m?parseInt(m[2]):1,type:/No syntax errors/.test(row.out)?"info":"error",message:row.out,codeSnippet:""}]})}for(const f of phpFiles){const bp=phpBestPractices(readSafe(f));if(bp.length)mergeIssues(out,{file:path.relative(root,f),issues:bp.map(x=>({line:1,...x}))})}}
-const deps={node:parseNpmDeps(root),python:parsePyDeps(root),java:parseMavenDeps(root),php:parseComposerDeps(root)}
-const duplicates=shingleDup(files.filter(f=>/\.(js|jsx|ts|tsx|py|java|php|c|cpp|cc|cxx|hpp|hh|h)$/.test(f)),root)
-const flatIssues=[]
-for(const k of Object.keys(out)){for(const it of out[k].issues){flatIssues.push({file:k,line:it.line,type:it.type,message:it.message,codeSnippet:it.codeSnippet||""})}}
-const ai=await aiExplainBatch(flatIssues)
-const aiMap={}
-for(const a of ai){const key=`${a.file}::${a.line}::${a.type}::${a.message}`;aiMap[key]=a}
-const results=[]
-for(const k of Object.keys(out)){const fileIssues=out[k].issues.map(it=>{const key=`${k}::${it.line}::${it.type}::${it.message}`;const extra=aiMap[key]||{};return {line:it.line,type:it.type,message:it.message,suggestion:extra.suggestion||"",fixSnippet:extra.fixSnippet||""}})
-results.push({file:k,issues:fileIssues})}
-return {results,dependencies:{node:deps.node,python:deps.python,java:deps.java,php:deps.php},duplicates}
+// Helper delay
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const prepareUpload=async (req)=>{const work=fs.mkdtempSync(path.join(os.tmpdir(),"aidbg-"));ensureDir(work);if(req.body&&req.body.repoUrl){const git=simpleGit();await git.clone(req.body.repoUrl,work)}else if(req.file){const f=req.file.path;const name=req.file.originalname.toLowerCase();if(name.endsWith(".zip")){const zip=new AdmZip(f);zip.extractAllTo(work,true)}else{const dest=path.join(work,req.file.originalname);fs.renameSync(f,dest)}}return work}
+// Language extensions
+const LANGUAGE_EXTENSIONS = {
+  python: [".py"],
+  javascript: [".js", ".jsx"],
+  typescript: [".ts", ".tsx"],
+  java: [".java"],
+  c: [".c"],
+  cpp: [".cpp", ".cc", ".cxx", ".c++"],
+  php: [".php"],
+};
 
-app.post("/analyze",upload.single("file"),async (req,res)=>{try{const dir=await prepareUpload(req);const data=await analyzeDir(dir);rmdir(dir);res.json(data)}catch(e){res.status(500).json({error:String(e)})}})
+// Dependency/config files
+const DEPENDENCY_FILES = [
+  "package.json",
+  "requirements.txt",
+  "Pipfile",
+  "pyproject.toml",
+  "pom.xml",
+  "build.gradle",
+  "Cargo.toml",
+  "composer.json",
+  "Gemfile",
+  "go.mod",
+  "go.sum",
+];
 
-app.get("/health",(req,res)=>res.json({ok:true}))
+// Detect language
+function detectLanguage(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  for (const [lang, extensions] of Object.entries(LANGUAGE_EXTENSIONS)) {
+    if (extensions.includes(ext)) return lang;
+  }
+  return "unknown";
+}
 
-const PORT=process.env.PORT||3000
-app.listen(PORT,()=>{})
+// File filters
+function isCodeFile(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  return Object.values(LANGUAGE_EXTENSIONS).flat().includes(ext);
+}
+function isDependencyFile(filename) {
+  return DEPENDENCY_FILES.includes(path.basename(filename));
+}
 
-module.exports = app;
+// Extract zip
+function extractZip(zipPath, extractPath) {
+  try {
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(extractPath, true);
+    return true;
+  } catch (error) {
+    console.error("Error extracting zip:", error);
+    return false;
+  }
+}
+
+// Clone repo
+
+// Read files
+function readCodeFiles(dirPath) {
+  const files = [];
+  const ignoreDirs = [".git", "node_modules", "vendor", "dist", "build", "pycache"];
+  const ignoreFiles = [".DS_Store", "Thumbs.db"];
+
+  function readRecursive(currentPath) {
+    const items = fs.readdirSync(currentPath);
+    for (const item of items) {
+      if (ignoreDirs.includes(item)) continue;
+
+      const fullPath = path.join(currentPath, item);
+      const stat = fs.statSync(fullPath);
+      if (stat.isDirectory()) {
+        readRecursive(fullPath);
+      } else if (stat.isFile() && !ignoreFiles.includes(item)) {
+        if (isCodeFile(fullPath) || isDependencyFile(fullPath)) {
+          try {
+            const content = fs.readFileSync(fullPath, "utf8");
+            files.push({
+              path: fullPath,
+              content,
+              language: isDependencyFile(fullPath)
+                ? "dependency"
+                : detectLanguage(fullPath),
+            });
+          } catch {
+            console.log(`Skipping file: ${fullPath}`);
+          }
+        }
+      }
+    }
+  }
+
+  readRecursive(dirPath);
+  return files;
+}
+
+// ---- SSE Support ----
+let clients = [];
+app.get("/progress", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  clients.push(res);
+
+  req.on("close", () => {
+    clients = clients.filter((c) => c !== res);
+  });
+});
+
+function broadcast(event, data) {
+  clients.forEach((res) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  });
+}
+
+// Call Gemini
+async function callGeminiAPI(codeContent, language, retries = 3) {
+  const prompt = `
+You are an expert code analyzer for ${language}.
+Check for: syntax errors, dependency issues, duplicate code, security risks, performance problems, and best practice violations.
+Return ONLY valid JSON like this:
+
+{
+  "issues": [
+    { "line": 10, "type": "syntax_error", "message": "Issue description", "suggestion": "Suggested fix" }
+  ]
+}
+
+Types: syntax_error, dependency, duplicate, security, performance, best_practice
+Code:\n${codeContent}
+`;
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+        }
+      );
+
+      if (response.status === 429) {
+        console.warn("⚠️ Rate limited. Retrying...");
+        await delay(2000 * (i + 1));
+        continue;
+      }
+      if (!response.ok) throw new Error(`Gemini API error: ${response.statusText}`);
+      const data = await response.json();
+      let text = data.candidates[0].content.parts[0].text.trim();
+      if (text.startsWith("```json")) text = text.replace(/```json|```/g, "");
+      return JSON.parse(text);
+    } catch (err) {
+      if (i === retries - 1) {
+        return {
+          issues: [
+            { line: 0, type: "error", message: err.message, suggestion: "Check API call" },
+          ],
+        };
+      }
+    }
+  }
+}
+
+// Analyze files with SSE logs
+async function analyzeFiles(files) {
+  const results = [];
+  const total = files.length;
+
+  console.log(`📑 Starting analysis of ${total} files...`);
+  broadcast("progress", { message: `📑 Starting analysis of ${total} files`, progress: 0 });
+
+  for (let i = 0; i < total; i++) {
+    const file = files[i];
+    const progress = (((i + 1) / total) * 100).toFixed(1);
+
+    const msg = `🔍 [${i + 1}/${total}] (${progress}%) Analyzing ${file.path}`;
+    console.log(msg);
+    broadcast("progress", { message: msg, progress });
+
+    let issues = [];
+    const aiResult = await callGeminiAPI(
+      `--- File: ${file.path} ---\n${file.content}`,
+      file.language
+    );
+    if (aiResult.issues) {
+      const doneMsg = `✅  Vektor  analyzed ${file.path}, found ${aiResult.issues.length} issues`;
+      console.log(doneMsg);
+      broadcast("progress", { message: doneMsg, progress });
+      issues = issues.concat(aiResult.issues);
+    }
+
+    results.push({ file: file.path, language: file.language, issues });
+
+    console.log("⏳ Waiting before next file...");
+    await delay(1000);
+  }
+
+  console.log("🚀 Analysis complete.");
+  broadcast("end", { message: "🚀 Analysis complete." });
+  return results;
+}
+
+
+// Direct code
+app.post("/api/analyze/code", async (req, res) => {
+  try {
+    const { code, filename = "code.txt" } = req.body;
+    if (!code) return res.status(400).json({ error: "No code provided" });
+
+    const language = detectLanguage(filename);
+    const aiResponse = await callGeminiAPI(
+      code,
+      language !== "unknown" ? language : "javascript"
+    );
+    res.json(aiResponse);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+// Upload only
+app.post("/api/upload", upload.array("files"), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const uploadId = Date.now().toString();
+    const extractPath = `extracted/${uploadId}`;
+    fs.mkdirSync(extractPath, { recursive: true });
+
+    for (const file of req.files) {
+      const dest = path.join(extractPath, file.originalname);
+      fs.renameSync(file.path, dest);
+    }
+
+    res.json({ success: true, uploadId }); // return ID to use later
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// Analyze after upload
+app.post("/api/analyze/:uploadId", async (req, res) => {
+  try {
+    const { uploadId } = req.params;
+    const extractPath = `extracted/${uploadId}`;
+
+    if (!fs.existsSync(extractPath)) {
+      return res.status(400).json({ error: "Upload not found" });
+    }
+
+    const files = readCodeFiles(extractPath);
+    if (files.length === 0) {
+      return res.status(400).json({ error: "No relevant files found" });
+    }
+
+    const aiResponse = await analyzeFiles(files);
+    res.json(aiResponse);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Analysis failed" });
+  }
+});
+
+
+
+
+// Upload
+app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const extractPath = `extracted/${Date.now()}`;
+    fs.mkdirSync(extractPath, { recursive: true });
+
+    // Move all files into extractPath
+    for (const file of req.files) {
+      const dest = path.join(extractPath, file.originalname);
+      fs.renameSync(file.path, dest);
+    }
+
+    const files = readCodeFiles(extractPath);
+    if (files.length === 0)
+      return res.status(400).json({ error: "No relevant files found" });
+
+    const aiResponse = await analyzeFiles(files);
+    res.json(aiResponse);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+// ---- Modify cloneRepository ----
+async function cloneRepository(repoUrl, clonePath, token = null) {
+  try {
+    const git = simpleGit();
+    let url = repoUrl;
+
+    if (token) {
+      // Insert token into HTTPS clone URL
+      // https://<token>@github.com/username/repo.git
+      url = repoUrl.replace(
+        /^https:\/\//,
+        `https://${token}@`
+      );
+    }
+
+    await git.clone(url, clonePath);
+    return true;
+  } catch (error) {
+    console.error("Error cloning repository:", error);
+    return false;
+  }
+}
+
+// GitHub
+app.post("/analyze/github", async (req, res) => {
+  try {
+    const { repoUrl, token } = req.body;
+    if (!repoUrl) return res.status(400).json({ error: "Repository URL is required" });
+
+    const clonePath = `repos/${Date.now()}`;
+    fs.mkdirSync(clonePath, { recursive: true });
+
+    if (!(await cloneRepository(repoUrl, clonePath, token))) {
+      return res.status(500).json({ error: "Failed to clone repo" });
+    }
+
+    const files = readCodeFiles(clonePath);
+    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
+
+    const aiResponse = await analyzeFiles(files);
+    res.json(aiResponse);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+// Health check
+app.get("/health", (req, res) => res.json({ status: "OK", message: "Server running" }));
+
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
