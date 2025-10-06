@@ -2,12 +2,11 @@ import express from "express";
 import multer from "multer";
 import AdmZip from "adm-zip";
 import cors from "cors";
-import simpleGit from "simple-git";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import fetch from "node-fetch"; // add if Node < 18
+import fetch from "node-fetch"; // needed if Node < 18
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -33,23 +32,20 @@ app.use(
 );
 
 // Gemini API key
-const GEMINI_API_KEY =
-  process.env.GEMINI_API_KEY || "YOUR_GEMINI_API_KEY";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
 
 // Middleware
 app.use(express.json());
 app.use(express.static("public"));
 
 // ------------------- PATHS -------------------
-const BASE_TMP = "/tmp"; // works locally & serverless
+const BASE_TMP = "/tmp"; // works locally & on Vercel
 const UPLOADS_PATH = path.join(BASE_TMP, "uploads");
 const EXTRACTED_PATH = path.join(BASE_TMP, "extracted");
 const REPOS_PATH = path.join(BASE_TMP, "repos");
-
-// Ensure dirs exist
-[UPLOADS_PATH, EXTRACTED_PATH, REPOS_PATH].forEach((p) => {
-  fs.mkdirSync(p, { recursive: true });
-});
+[UPLOADS_PATH, EXTRACTED_PATH, REPOS_PATH].forEach((p) =>
+  fs.mkdirSync(p, { recursive: true })
+);
 
 // ------------------- MULTER -------------------
 const storage = multer.diskStorage({
@@ -245,7 +241,7 @@ app.post("/api/analyze/code", async (req, res) => {
     const language = detectLanguage(filename);
     const aiResponse = await callGeminiAPI(code, language !== "unknown" ? language : "javascript");
     res.json(aiResponse);
-  } catch (error) {
+  } catch {
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -307,43 +303,72 @@ app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
   }
 });
 
-// Clone GitHub repo
-async function cloneRepository(repoUrl, clonePath, token = null) {
+// --- Download & extract GitHub repo ZIP (Vercel-compatible) ---
+async function downloadRepoZip(repoUrl, extractPath, token = null) {
   try {
-    const git = simpleGit();
-    let url = repoUrl;
-    if (token) {
-      url = repoUrl.replace(/^https:\/\//, `https://${token}@`);
+    const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)(?:\.git)?/);
+    if (!match) throw new Error("Invalid GitHub URL");
+    const owner = match[1];
+    const repo = match[2];
+
+    const zipUrl = `https://api.github.com/repos/${owner}/${repo}/zipball/main`;
+
+    const headers = {
+      "User-Agent": "Vektor-Insight",
+      Accept: "application/vnd.github.v3+json",
+    };
+    if (token) headers["Authorization"] = `token ${token}`;
+
+    const response = await fetch(zipUrl, { headers });
+    if (!response.ok) {
+      throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
     }
-    await git.clone(url, clonePath);
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const zipPath = path.join(extractPath, "repo.zip");
+    fs.writeFileSync(zipPath, buffer);
+
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(extractPath, true);
+
     return true;
-  } catch (error) {
-    console.error("Error cloning repo:", error);
+  } catch (err) {
+    console.error("Error downloading repo ZIP:", err.message);
     return false;
   }
 }
+
 app.post("/analyze/github", async (req, res) => {
   try {
     const { repoUrl, token } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "Repository URL is required" });
 
-    const clonePath = path.join(REPOS_PATH, Date.now().toString());
-    fs.mkdirSync(clonePath, { recursive: true });
+    const repoPath = path.join(REPOS_PATH, Date.now().toString());
+    fs.mkdirSync(repoPath, { recursive: true });
 
-    if (!(await cloneRepository(repoUrl, clonePath, token))) {
-      return res.status(500).json({ error: "Failed to clone repo" });
+    if (!(await downloadRepoZip(repoUrl, repoPath, token))) {
+      return res.status(500).json({ error: "Failed to download repo" });
     }
-    const files = readCodeFiles(clonePath);
+
+    // GitHub ZIPs extract into a single subfolder
+    const subDirs = fs.readdirSync(repoPath);
+    const extractedRoot = path.join(repoPath, subDirs[0]);
+
+    const files = readCodeFiles(extractedRoot);
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
+
     const aiResponse = await analyzeFiles(files);
     res.json(aiResponse);
-  } catch {
+  } catch (error) {
+    console.error("GitHub analysis error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
 // Health check
-app.get("/health", (req, res) => res.json({ status: "OK", message: "Server running" }));
+app.get("/health", (req, res) =>
+  res.json({ status: "OK", message: "Server running" })
+);
 
 // Start
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
