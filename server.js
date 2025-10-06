@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import fetch from "node-fetch"; // ✅ add if Node < 18
+import fetch from "node-fetch"; // add if Node < 18
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -15,6 +15,7 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Allowed origins
 const ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "https://vektor-insight.vercel.app",
@@ -32,20 +33,28 @@ app.use(
 );
 
 // Gemini API key
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY || "YOUR_GEMINI_API_KEY";
 
 // Middleware
 app.use(express.json());
 app.use(express.static("public"));
 
-// Multer storage config
+// ------------------- PATHS -------------------
+const BASE_TMP = "/tmp"; // works locally & serverless
+const UPLOADS_PATH = path.join(BASE_TMP, "uploads");
+const EXTRACTED_PATH = path.join(BASE_TMP, "extracted");
+const REPOS_PATH = path.join(BASE_TMP, "repos");
+
+// Ensure dirs exist
+[UPLOADS_PATH, EXTRACTED_PATH, REPOS_PATH].forEach((p) => {
+  fs.mkdirSync(p, { recursive: true });
+});
+
+// ------------------- MULTER -------------------
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = "uploads/";
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
+    cb(null, UPLOADS_PATH);
   },
   filename: (req, file, cb) => {
     cb(null, Date.now() + "-" + file.originalname);
@@ -53,12 +62,11 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Helper delay
+// ------------------- HELPERS -------------------
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Language extensions
 const LANGUAGE_EXTENSIONS = {
   python: [".py"],
   javascript: [".js", ".jsx"],
@@ -69,7 +77,6 @@ const LANGUAGE_EXTENSIONS = {
   php: [".php"],
 };
 
-// Dependency/config files
 const DEPENDENCY_FILES = [
   "package.json",
   "requirements.txt",
@@ -84,7 +91,6 @@ const DEPENDENCY_FILES = [
   "go.sum",
 ];
 
-// Detect language
 function detectLanguage(filename) {
   const ext = path.extname(filename).toLowerCase();
   for (const [lang, extensions] of Object.entries(LANGUAGE_EXTENSIONS)) {
@@ -93,7 +99,6 @@ function detectLanguage(filename) {
   return "unknown";
 }
 
-// File filters
 function isCodeFile(filename) {
   const ext = path.extname(filename).toLowerCase();
   return Object.values(LANGUAGE_EXTENSIONS).flat().includes(ext);
@@ -102,21 +107,6 @@ function isDependencyFile(filename) {
   return DEPENDENCY_FILES.includes(path.basename(filename));
 }
 
-// Extract zip
-function extractZip(zipPath, extractPath) {
-  try {
-    const zip = new AdmZip(zipPath);
-    zip.extractAllTo(extractPath, true);
-    return true;
-  } catch (error) {
-    console.error("Error extracting zip:", error);
-    return false;
-  }
-}
-
-// Clone repo
-
-// Read files
 function readCodeFiles(dirPath) {
   const files = [];
   const ignoreDirs = [".git", "node_modules", "vendor", "dist", "build", "pycache"];
@@ -126,7 +116,6 @@ function readCodeFiles(dirPath) {
     const items = fs.readdirSync(currentPath);
     for (const item of items) {
       if (ignoreDirs.includes(item)) continue;
-
       const fullPath = path.join(currentPath, item);
       const stat = fs.statSync(fullPath);
       if (stat.isDirectory()) {
@@ -149,26 +138,22 @@ function readCodeFiles(dirPath) {
       }
     }
   }
-
   readRecursive(dirPath);
   return files;
 }
 
-// ---- SSE Support ----
+// ------------------- SSE -------------------
 let clients = [];
 app.get("/progress", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
-
   clients.push(res);
-
   req.on("close", () => {
     clients = clients.filter((c) => c !== res);
   });
 });
-
 function broadcast(event, data) {
   clients.forEach((res) => {
     res.write(`event: ${event}\n`);
@@ -176,7 +161,7 @@ function broadcast(event, data) {
   });
 }
 
-// Call Gemini
+// ------------------- GEMINI CALL -------------------
 async function callGeminiAPI(codeContent, language, retries = 3) {
   const prompt = `
 You are an expert code analyzer for ${language}.
@@ -203,9 +188,7 @@ Code:\n${codeContent}
           body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
         }
       );
-
       if (response.status === 429) {
-        console.warn("⚠️ Rate limited. Retrying...");
         await delay(2000 * (i + 1));
         continue;
       }
@@ -217,75 +200,55 @@ Code:\n${codeContent}
     } catch (err) {
       if (i === retries - 1) {
         return {
-          issues: [
-            { line: 0, type: "error", message: err.message, suggestion: "Check API call" },
-          ],
+          issues: [{ line: 0, type: "error", message: err.message, suggestion: "Check API call" }],
         };
       }
     }
   }
 }
 
-// Analyze files with SSE logs
+// ------------------- ANALYSIS -------------------
 async function analyzeFiles(files) {
   const results = [];
   const total = files.length;
-
-  console.log(`📑 Starting analysis of ${total} files...`);
   broadcast("progress", { message: `📑 Starting analysis of ${total} files`, progress: 0 });
 
   for (let i = 0; i < total; i++) {
     const file = files[i];
     const progress = (((i + 1) / total) * 100).toFixed(1);
-
-    const msg = `🔍 [${i + 1}/${total}] (${progress}%) Analyzing ${file.path}`;
-    console.log(msg);
-    broadcast("progress", { message: msg, progress });
+    broadcast("progress", { message: `🔍 [${i + 1}/${total}] (${progress}%) Analyzing ${file.path}`, progress });
 
     let issues = [];
-    const aiResult = await callGeminiAPI(
-      `--- File: ${file.path} ---\n${file.content}`,
-      file.language
-    );
+    const aiResult = await callGeminiAPI(file.content, file.language);
     if (aiResult.issues) {
-      const doneMsg = `✅  Vektor  analyzed ${file.path}, found ${aiResult.issues.length} issues`;
-      console.log(doneMsg);
-      broadcast("progress", { message: doneMsg, progress });
-      issues = issues.concat(aiResult.issues);
+      broadcast("progress", {
+        message: `✅ analyzed ${file.path}, found ${aiResult.issues.length} issues`,
+        progress,
+      });
+      issues = aiResult.issues;
     }
-
     results.push({ file: file.path, language: file.language, issues });
-
-    console.log("⏳ Waiting before next file...");
     await delay(1000);
   }
 
-  console.log("🚀 Analysis complete.");
   broadcast("end", { message: "🚀 Analysis complete." });
   return results;
 }
 
+// ------------------- ROUTES -------------------
 
 // Direct code
 app.post("/api/analyze/code", async (req, res) => {
   try {
     const { code, filename = "code.txt" } = req.body;
     if (!code) return res.status(400).json({ error: "No code provided" });
-
     const language = detectLanguage(filename);
-    const aiResponse = await callGeminiAPI(
-      code,
-      language !== "unknown" ? language : "javascript"
-    );
+    const aiResponse = await callGeminiAPI(code, language !== "unknown" ? language : "javascript");
     res.json(aiResponse);
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
-
-
 
 // Upload only
 app.post("/api/upload", upload.array("files"), async (req, res) => {
@@ -293,126 +256,94 @@ app.post("/api/upload", upload.array("files"), async (req, res) => {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: "No files uploaded" });
     }
-
     const uploadId = Date.now().toString();
-    const extractPath = `extracted/${uploadId}`;
+    const extractPath = path.join(EXTRACTED_PATH, uploadId);
     fs.mkdirSync(extractPath, { recursive: true });
-
     for (const file of req.files) {
       const dest = path.join(extractPath, file.originalname);
       fs.renameSync(file.path, dest);
     }
-
-    res.json({ success: true, uploadId }); // return ID to use later
-  } catch (error) {
-    console.error(error);
+    res.json({ success: true, uploadId });
+  } catch {
     res.status(500).json({ error: "Upload failed" });
   }
 });
 
-// Analyze after upload
+// Analyze uploaded folder
 app.post("/api/analyze/:uploadId", async (req, res) => {
   try {
     const { uploadId } = req.params;
-    const extractPath = `extracted/${uploadId}`;
-
+    const extractPath = path.join(EXTRACTED_PATH, uploadId);
     if (!fs.existsSync(extractPath)) {
       return res.status(400).json({ error: "Upload not found" });
     }
-
     const files = readCodeFiles(extractPath);
-    if (files.length === 0) {
-      return res.status(400).json({ error: "No relevant files found" });
-    }
-
+    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
     const aiResponse = await analyzeFiles(files);
     res.json(aiResponse);
-  } catch (error) {
-    console.error(error);
+  } catch {
     res.status(500).json({ error: "Analysis failed" });
   }
 });
 
-
-
-
-// Upload
+// Upload & analyze directly
 app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: "No files uploaded" });
     }
-
-    const extractPath = `extracted/${Date.now()}`;
+    const extractPath = path.join(EXTRACTED_PATH, Date.now().toString());
     fs.mkdirSync(extractPath, { recursive: true });
-
-    // Move all files into extractPath
     for (const file of req.files) {
       const dest = path.join(extractPath, file.originalname);
       fs.renameSync(file.path, dest);
     }
-
     const files = readCodeFiles(extractPath);
-    if (files.length === 0)
-      return res.status(400).json({ error: "No relevant files found" });
-
+    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
     const aiResponse = await analyzeFiles(files);
     res.json(aiResponse);
-  } catch (error) {
-    console.error(error);
+  } catch {
     res.status(500).json({ error: "Internal server error" });
   }
 });
-// ---- Modify cloneRepository ----
+
+// Clone GitHub repo
 async function cloneRepository(repoUrl, clonePath, token = null) {
   try {
     const git = simpleGit();
     let url = repoUrl;
-
     if (token) {
-      // Insert token into HTTPS clone URL
-      // https://<token>@github.com/username/repo.git
-      url = repoUrl.replace(
-        /^https:\/\//,
-        `https://${token}@`
-      );
+      url = repoUrl.replace(/^https:\/\//, `https://${token}@`);
     }
-
     await git.clone(url, clonePath);
     return true;
   } catch (error) {
-    console.error("Error cloning repository:", error);
+    console.error("Error cloning repo:", error);
     return false;
   }
 }
-
-// GitHub
 app.post("/analyze/github", async (req, res) => {
   try {
     const { repoUrl, token } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "Repository URL is required" });
 
-    const clonePath = `repos/${Date.now()}`;
+    const clonePath = path.join(REPOS_PATH, Date.now().toString());
     fs.mkdirSync(clonePath, { recursive: true });
 
     if (!(await cloneRepository(repoUrl, clonePath, token))) {
       return res.status(500).json({ error: "Failed to clone repo" });
     }
-
     const files = readCodeFiles(clonePath);
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
-
     const aiResponse = await analyzeFiles(files);
     res.json(aiResponse);
-  } catch (error) {
-    console.error(error);
+  } catch {
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-
-
 // Health check
 app.get("/health", (req, res) => res.json({ status: "OK", message: "Server running" }));
 
+// Start
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
