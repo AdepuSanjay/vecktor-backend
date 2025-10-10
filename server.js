@@ -97,10 +97,12 @@ function detectLanguage(filename) {
 
 function isCodeFile(filename) {
   const ext = path.extname(filename).toLowerCase();
+
+  // Explicitly exclude stylesheets
+  const ignoreExts = [".css", ".scss", ".sass", ".less", ".styl"];
+  if (ignoreExts.includes(ext)) return false;
+
   return Object.values(LANGUAGE_EXTENSIONS).flat().includes(ext);
-}
-function isDependencyFile(filename) {
-  return DEPENDENCY_FILES.includes(path.basename(filename));
 }
 
 function readCodeFiles(dirPath) {
