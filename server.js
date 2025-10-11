@@ -1,3 +1,4 @@
+
 import express from "express";
 import multer from "multer";
 import AdmZip from "adm-zip";
@@ -31,18 +32,8 @@ app.use(
   })
 );
 
-// Multiple Gemini API keys for load balancing
-const GEMINI_API_KEYS = [
-  process.env.GEMINI_API_KEY_1 || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs",
-  process.env.GEMINI_API_KEY_2 || "AIzaSyD8_ir9uyfEB2vTlyc7D2X5EWYwQRnjGt4", // Add your second API key
-];
-
-// API usage tracker
-let apiUsage = GEMINI_API_KEYS.map(() => ({ 
-  requests: 0, 
-  lastReset: Date.now(),
-  errors: 0 
-}));
+// Gemini API key
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
 
 // Middleware
 app.use(express.json());
@@ -71,51 +62,6 @@ const upload = multer({ storage });
 // ------------------- HELPERS -------------------
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Reset API usage every hour
-function resetApiUsage() {
-  const now = Date.now();
-  const oneHour = 60 * 60 * 1000;
-  
-  apiUsage.forEach((usage, index) => {
-    if (now - usage.lastReset > oneHour) {
-      apiUsage[index] = { requests: 0, lastReset: now, errors: 0 };
-      console.log(`🔄 Reset API ${index + 1} usage`);
-    }
-  });
-}
-
-// Smart API key selection with load balancing
-function getBestApiKey() {
-  resetApiUsage();
-  
-  // Find API with least recent usage and errors
-  const sortedApis = apiUsage
-    .map((usage, index) => ({ ...usage, index }))
-    .sort((a, b) => {
-      // Prioritize APIs with fewer errors
-      if (a.errors !== b.errors) return a.errors - b.errors;
-      // Then by fewer requests
-      return a.requests - b.requests;
-    });
-
-  const bestApi = sortedApis[0];
-  apiUsage[bestApi.index].requests++;
-  
-  console.log(`🔑 Using API ${bestApi.index + 1} (Requests: ${bestApi.requests}, Errors: ${bestApi.errors})`);
-  return {
-    key: GEMINI_API_KEYS[bestApi.index],
-    index: bestApi.index
-  };
-}
-
-// Mark API as having error
-function markApiError(apiIndex) {
-  if (apiIndex >= 0 && apiIndex < apiUsage.length) {
-    apiUsage[apiIndex].errors++;
-    console.log(`❌ Marked API ${apiIndex + 1} with error (Total errors: ${apiUsage[apiIndex].errors})`);
-  }
 }
 
 const LANGUAGE_EXTENSIONS = {
@@ -236,7 +182,7 @@ function broadcast(event, data) {
   });
 }
 
-// ------------------- GEMINI CALL (DUAL API) -------------------
+// ------------------- GEMINI CALL -------------------
 async function callGeminiAPI(codeContent, language, retries = 3) {
   const prompt = `
 You are an expert code analyzer for ${language}.
@@ -253,16 +199,10 @@ Types: syntax_error, dependency, duplicate, security, performance, best_practice
 Code:\n${codeContent}
 `;
 
-  for (let attempt = 0; attempt < retries; attempt++) {
-    const { key: apiKey, index: apiIndex } = getBestApiKey();
-    
+  for (let i = 0; i < retries; i++) {
     try {
-      broadcast("progress", { 
-        message: `🤖 Using API ${apiIndex + 1} (Attempt ${attempt + 1}/${retries})` 
-      });
-
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -271,36 +211,13 @@ Code:\n${codeContent}
       );
 
       if (response.status === 429) {
-        // Rate limited - mark this API as problematic and try another
-        markApiError(apiIndex);
-        broadcast("progress", { 
-          message: `⏳ Rate limited on API ${apiIndex + 1}, retrying with different API...` 
-        });
-        await delay(3000 * (attempt + 1));
+        await delay(2000 * (i + 1));
         continue;
       }
 
-      if (response.status === 403) {
-        // Quota exceeded - mark this API as problematic
-        markApiError(apiIndex);
-        broadcast("progress", { 
-          message: `🚫 Quota exceeded on API ${apiIndex + 1}, switching API...` 
-        });
-        await delay(2000);
-        continue;
-      }
-
-      if (!response.ok) {
-        throw new Error(`Gemini API error: ${response.status} ${response.statusText}`);
-      }
+      if (!response.ok) throw new Error(`Gemini API error: ${response.statusText}`);
 
       const data = await response.json();
-      
-      // Handle empty response
-      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
-        throw new Error("Empty response from Gemini API");
-      }
-
       let text = data.candidates[0].content.parts[0].text.trim();
 
       // Clean up JSON response
@@ -312,136 +229,64 @@ Code:\n${codeContent}
       }
       text = text.replace(/```/g, "").trim();
 
-      const result = JSON.parse(text);
-      
-      // Reset error count on successful call
-      if (apiUsage[apiIndex].errors > 0) {
-        apiUsage[apiIndex].errors = Math.max(0, apiUsage[apiIndex].errors - 1);
-      }
-      
-      return result;
+      return JSON.parse(text);
     } catch (err) {
-      console.error(`Gemini API ${apiIndex + 1} attempt ${attempt + 1} failed:`, err.message);
-      markApiError(apiIndex);
-      
-      if (attempt === retries - 1) {
+      console.error(`Gemini API attempt ${i + 1} failed:`, err.message);
+      if (i === retries - 1) {
         return {
-          issues: [{ 
-            line: 0, 
-            type: "error", 
-            message: `Analysis failed after ${retries} attempts: ${err.message}`, 
-            suggestion: "Try again later or with smaller files" 
-          }],
+          issues: [{ line: 0, type: "error", message: err.message, suggestion: "Check API call" }],
         };
       }
-      
-      await delay(2000 * (attempt + 1));
     }
   }
 }
 
-// ------------------- BATCH ANALYSIS -------------------
-async function analyzeFilesInBatches(files, batchSize = 5) {
+// ------------------- ANALYSIS -------------------
+async function analyzeFiles(files) {
   const results = [];
   const total = files.length;
-  let processed = 0;
 
   if (total === 0) {
     return results;
   }
 
-  broadcast("progress", { 
-    message: `📑 Starting batch analysis of ${total} files (Batch size: ${batchSize})`, 
-    progress: 0 
-  });
+  broadcast("progress", { message: `📑 Starting analysis of ${total} files`, progress: 0 });
 
-  // Process files in batches to avoid overwhelming the APIs
-  for (let i = 0; i < total; i += batchSize) {
-    const batch = files.slice(i, i + batchSize);
-    const batchNumber = Math.floor(i / batchSize) + 1;
-    const totalBatches = Math.ceil(total / batchSize);
+  for (let i = 0; i < total; i++) {
+    const file = files[i];
+    const progress = (((i + 1) / total) * 100).toFixed(1);
 
-    broadcast("progress", {
-      message: `🔄 Processing batch ${batchNumber}/${totalBatches} (${batch.length} files)`,
-      progress: (i / total) * 100
+    broadcast("progress", { 
+      message: `🔍 [${i + 1}/${total}] (${progress}%) Analyzing ${path.basename(file.path)}`, 
+      progress 
     });
 
-    const batchPromises = batch.map(async (file, index) => {
-      const fileNumber = i + index + 1;
-      const progress = ((fileNumber / total) * 100).toFixed(1);
+    let issues = [];
 
-      broadcast("progress", { 
-        message: `🔍 [${fileNumber}/${total}] (${progress}%) Analyzing ${path.basename(file.path)}`, 
-        progress 
-      });
-
-      let issues = [];
-
-      try {
-        const aiResult = await callGeminiAPI(file.content, file.language);
-        if (aiResult && aiResult.issues) {
-          broadcast("progress", {
-            message: `✅ Analyzed ${path.basename(file.path)}, found ${aiResult.issues.length} issues`,
-            progress,
-          });
-          issues = aiResult.issues;
-        }
-      } catch (error) {
-        console.error(`Error analyzing ${file.path}:`, error);
-        issues = [{ 
-          line: 0, 
-          type: "error", 
-          message: "Analysis failed", 
-          suggestion: "Try again" 
-        }];
-      }
-
-      processed++;
-      return { 
-        file: file.path, 
-        language: file.language, 
-        issues 
-      };
-    });
-
-    // Wait for current batch to complete
-    const batchResults = await Promise.allSettled(batchPromises);
-    
-    // Process batch results
-    batchResults.forEach((result, index) => {
-      if (result.status === 'fulfilled') {
-        results.push(result.value);
-      } else {
-        const file = batch[index];
-        results.push({
-          file: file.path,
-          language: file.language,
-          issues: [{ 
-            line: 0, 
-            type: "error", 
-            message: "Batch analysis failed", 
-            suggestion: "Try again" 
-          }]
+    try {
+      const aiResult = await callGeminiAPI(file.content, file.language);
+      if (aiResult && aiResult.issues) {
+        broadcast("progress", {
+          message: `✅ Analyzed ${path.basename(file.path)}, found ${aiResult.issues.length} issues`,
+          progress,
         });
+        issues = aiResult.issues;
       }
+    } catch (error) {
+      console.error(`Error analyzing ${file.path}:`, error);
+      issues = [{ line: 0, type: "error", message: "Analysis failed", suggestion: "Try again" }];
+    }
+
+    results.push({ 
+      file: file.path, 
+      language: file.language, 
+      issues 
     });
 
-    // Delay between batches to avoid rate limiting
-    if (i + batchSize < total) {
-      broadcast("progress", {
-        message: `⏳ Waiting before next batch...`,
-        progress: ((i + batchSize) / total) * 100
-      });
-      await delay(3000);
-    }
+    await delay(1000);
   }
 
-  broadcast("progress", { 
-    message: `🎉 Analysis complete! Processed ${processed}/${total} files successfully`, 
-    progress: 100 
-  });
   broadcast("end", { message: "🚀 Analysis complete." });
-  
   return results;
 }
 
@@ -478,18 +323,17 @@ app.post("/api/upload", upload.array("files"), async (req, res) => {
       fs.renameSync(file.path, dest);
     }
 
-    res.json({ success: true, uploadId, fileCount: req.files.length });
+    res.json({ success: true, uploadId });
   } catch (error) {
     console.error("Upload error:", error);
     res.status(500).json({ error: "Upload failed" });
   }
 });
 
-// Analyze uploaded folder with batch processing
+// Analyze uploaded folder
 app.post("/api/analyze/:uploadId", async (req, res) => {
   try {
     const { uploadId } = req.params;
-    const { batchSize = 5 } = req.body; // Allow client to specify batch size
     const extractPath = path.join(EXTRACTED_PATH, uploadId);
 
     if (!fs.existsSync(extractPath)) {
@@ -499,11 +343,7 @@ app.post("/api/analyze/:uploadId", async (req, res) => {
     const files = readCodeFiles(extractPath);
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
 
-    broadcast("progress", {
-      message: `📊 Found ${files.length} code files. Starting batch analysis...`
-    });
-
-    const aiResponse = await analyzeFilesInBatches(files, parseInt(batchSize));
+    const aiResponse = await analyzeFiles(files);
     res.json(aiResponse);
   } catch (error) {
     console.error("Analysis error:", error);
@@ -511,7 +351,7 @@ app.post("/api/analyze/:uploadId", async (req, res) => {
   }
 });
 
-// Upload & analyze directly with batch processing
+// Upload & analyze directly
 app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
@@ -529,19 +369,13 @@ app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
     const files = readCodeFiles(extractPath);
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
 
-    broadcast("progress", {
-      message: `📊 Found ${files.length} code files. Starting batch analysis...`
-    });
-
-    const aiResponse = await analyzeFilesInBatches(files, 5); // Default batch size 5
+    const aiResponse = await analyzeFiles(files);
     res.json(aiResponse);
   } catch (error) {
     console.error("Upload analysis error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
-// ... (rest of your routes remain the same - GitHub analysis, health check, etc.)
 
 // Download & extract GitHub repo ZIP
 async function downloadRepoZip(repoUrl, extractPath, token = null) {
@@ -579,10 +413,10 @@ async function downloadRepoZip(repoUrl, extractPath, token = null) {
   }
 }
 
-// GitHub repo analysis with batch processing
+// GitHub repo analysis
 app.post("/analyze/github", async (req, res) => {
   try {
-    const { repoUrl, token, batchSize = 5 } = req.body;
+    const { repoUrl, token } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "Repository URL is required" });
 
     const repoPath = path.join(REPOS_PATH, Date.now().toString());    
@@ -605,11 +439,7 @@ app.post("/analyze/github", async (req, res) => {
     const files = readCodeFiles(extractedRoot);    
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });    
 
-    broadcast("progress", {
-      message: `📊 Found ${files.length} code files in repository. Starting batch analysis...`
-    });
-
-    const aiResponse = await analyzeFilesInBatches(files, parseInt(batchSize));    
+    const aiResponse = await analyzeFiles(files);    
     res.json(aiResponse);
   } catch (error) {
     console.error("GitHub analysis error:", error);
@@ -617,34 +447,11 @@ app.post("/analyze/github", async (req, res) => {
   }
 });
 
-// Health check with API status
-app.get("/health", (req, res) => {
-  resetApiUsage();
-  res.json({ 
-    status: "OK", 
-    message: "Server running",
-    apiStatus: apiUsage.map((usage, index) => ({
-      api: index + 1,
-      requests: usage.requests,
-      errors: usage.errors,
-      lastReset: new Date(usage.lastReset).toISOString()
-    }))
-  });
-});
-
-// API status endpoint
-app.get("/api/status", (req, res) => {
-  resetApiUsage();
-  res.json({
-    totalApis: GEMINI_API_KEYS.length,
-    usage: apiUsage.map((usage, index) => ({
-      api: index + 1,
-      requests: usage.requests,
-      errors: usage.errors,
-      health: usage.errors > 10 ? "poor" : usage.errors > 5 ? "degraded" : "good"
-    }))
-  });
-});
+// Health check
+app.get("/health", (req, res) =>
+  res.json({ status: "OK", message: "Server running" })
+);
 
 // Start server
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
