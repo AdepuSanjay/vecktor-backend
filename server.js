@@ -31,8 +31,18 @@ app.use(
   })
 );
 
-// Gemini API key
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
+// Multiple Gemini API keys for load balancing
+const GEMINI_API_KEYS = [
+  process.env.GEMINI_API_KEY_1 || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs",
+  process.env.GEMINI_API_KEY_2 || "AIzaSyD8_ir9uyfEB2vTlyc7D2X5EWYwQRnjGt4", // Add your second API key
+];
+
+// API usage tracker
+let apiUsage = GEMINI_API_KEYS.map(() => ({ 
+  requests: 0, 
+  lastReset: Date.now(),
+  errors: 0 
+}));
 
 // Middleware
 app.use(express.json());
@@ -61,6 +71,51 @@ const upload = multer({ storage });
 // ------------------- HELPERS -------------------
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Reset API usage every hour
+function resetApiUsage() {
+  const now = Date.now();
+  const oneHour = 60 * 60 * 1000;
+  
+  apiUsage.forEach((usage, index) => {
+    if (now - usage.lastReset > oneHour) {
+      apiUsage[index] = { requests: 0, lastReset: now, errors: 0 };
+      console.log(`🔄 Reset API ${index + 1} usage`);
+    }
+  });
+}
+
+// Smart API key selection with load balancing
+function getBestApiKey() {
+  resetApiUsage();
+  
+  // Find API with least recent usage and errors
+  const sortedApis = apiUsage
+    .map((usage, index) => ({ ...usage, index }))
+    .sort((a, b) => {
+      // Prioritize APIs with fewer errors
+      if (a.errors !== b.errors) return a.errors - b.errors;
+      // Then by fewer requests
+      return a.requests - b.requests;
+    });
+
+  const bestApi = sortedApis[0];
+  apiUsage[bestApi.index].requests++;
+  
+  console.log(`🔑 Using API ${bestApi.index + 1} (Requests: ${bestApi.requests}, Errors: ${bestApi.errors})`);
+  return {
+    key: GEMINI_API_KEYS[bestApi.index],
+    index: bestApi.index
+  };
+}
+
+// Mark API as having error
+function markApiError(apiIndex) {
+  if (apiIndex >= 0 && apiIndex < apiUsage.length) {
+    apiUsage[apiIndex].errors++;
+    console.log(`❌ Marked API ${apiIndex + 1} with error (Total errors: ${apiUsage[apiIndex].errors})`);
+  }
 }
 
 const LANGUAGE_EXTENSIONS = {
@@ -100,12 +155,12 @@ function detectLanguage(filename) {
 
 function isCodeFile(filename) {
   const ext = path.extname(filename).toLowerCase();
-  
+
   // Skip CSS and related files
   if (IGNORE_EXTENSIONS.includes(ext)) {
     return false;
   }
-  
+
   return Object.values(LANGUAGE_EXTENSIONS).flat().includes(ext);
 }
 
@@ -127,10 +182,10 @@ function readCodeFiles(dirPath) {
     const items = fs.readdirSync(currentPath);
     for (const item of items) {
       if (ignoreDirs.includes(item)) continue;
-      
+
       const fullPath = path.join(currentPath, item);
       const stat = fs.statSync(fullPath);
-      
+
       if (stat.isDirectory()) {
         readRecursive(fullPath);
       } else if (stat.isFile() && !ignoreFiles.includes(item)) {
@@ -138,7 +193,7 @@ function readCodeFiles(dirPath) {
         if (shouldIgnoreFile(fullPath)) {
           continue;
         }
-        
+
         if (isCodeFile(fullPath) || isDependencyFile(fullPath)) {
           try {
             const content = fs.readFileSync(fullPath, "utf8");
@@ -156,7 +211,7 @@ function readCodeFiles(dirPath) {
       }
     }
   }
-  
+
   readRecursive(dirPath);
   return files;
 }
@@ -181,7 +236,7 @@ function broadcast(event, data) {
   });
 }
 
-// ------------------- GEMINI CALL -------------------
+// ------------------- GEMINI CALL (DUAL API) -------------------
 async function callGeminiAPI(codeContent, language, retries = 3) {
   const prompt = `
 You are an expert code analyzer for ${language}.
@@ -198,27 +253,56 @@ Types: syntax_error, dependency, duplicate, security, performance, best_practice
 Code:\n${codeContent}
 `;
 
-  for (let i = 0; i < retries; i++) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const { key: apiKey, index: apiIndex } = getBestApiKey();
+    
     try {
+      broadcast("progress", { 
+        message: `🤖 Using API ${apiIndex + 1} (Attempt ${attempt + 1}/${retries})` 
+      });
+
       const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
         }
       );
-      
+
       if (response.status === 429) {
-        await delay(2000 * (i + 1));
+        // Rate limited - mark this API as problematic and try another
+        markApiError(apiIndex);
+        broadcast("progress", { 
+          message: `⏳ Rate limited on API ${apiIndex + 1}, retrying with different API...` 
+        });
+        await delay(3000 * (attempt + 1));
         continue;
       }
-      
-      if (!response.ok) throw new Error(`Gemini API error: ${response.statusText}`);
-      
+
+      if (response.status === 403) {
+        // Quota exceeded - mark this API as problematic
+        markApiError(apiIndex);
+        broadcast("progress", { 
+          message: `🚫 Quota exceeded on API ${apiIndex + 1}, switching API...` 
+        });
+        await delay(2000);
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Gemini API error: ${response.status} ${response.statusText}`);
+      }
+
       const data = await response.json();
-      let text = data.candidates[0].content.parts[0].text.trim();
       
+      // Handle empty response
+      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+        throw new Error("Empty response from Gemini API");
+      }
+
+      let text = data.candidates[0].content.parts[0].text.trim();
+
       // Clean up JSON response
       if (text.startsWith("```json")) {
         text = text.slice(7);
@@ -227,65 +311,137 @@ Code:\n${codeContent}
         text = text.slice(0, -3);
       }
       text = text.replace(/```/g, "").trim();
+
+      const result = JSON.parse(text);
       
-      return JSON.parse(text);
+      // Reset error count on successful call
+      if (apiUsage[apiIndex].errors > 0) {
+        apiUsage[apiIndex].errors = Math.max(0, apiUsage[apiIndex].errors - 1);
+      }
+      
+      return result;
     } catch (err) {
-      console.error(`Gemini API attempt ${i + 1} failed:`, err.message);
-      if (i === retries - 1) {
+      console.error(`Gemini API ${apiIndex + 1} attempt ${attempt + 1} failed:`, err.message);
+      markApiError(apiIndex);
+      
+      if (attempt === retries - 1) {
         return {
-          issues: [{ line: 0, type: "error", message: err.message, suggestion: "Check API call" }],
+          issues: [{ 
+            line: 0, 
+            type: "error", 
+            message: `Analysis failed after ${retries} attempts: ${err.message}`, 
+            suggestion: "Try again later or with smaller files" 
+          }],
         };
       }
+      
+      await delay(2000 * (attempt + 1));
     }
   }
 }
 
-// ------------------- ANALYSIS -------------------
-async function analyzeFiles(files) {
+// ------------------- BATCH ANALYSIS -------------------
+async function analyzeFilesInBatches(files, batchSize = 5) {
   const results = [];
   const total = files.length;
-  
+  let processed = 0;
+
   if (total === 0) {
     return results;
   }
-  
-  broadcast("progress", { message: `📑 Starting analysis of ${total} files`, progress: 0 });
 
-  for (let i = 0; i < total; i++) {
-    const file = files[i];
-    const progress = (((i + 1) / total) * 100).toFixed(1);
-    
-    broadcast("progress", { 
-      message: `🔍 [${i + 1}/${total}] (${progress}%) Analyzing ${path.basename(file.path)}`, 
-      progress 
+  broadcast("progress", { 
+    message: `📑 Starting batch analysis of ${total} files (Batch size: ${batchSize})`, 
+    progress: 0 
+  });
+
+  // Process files in batches to avoid overwhelming the APIs
+  for (let i = 0; i < total; i += batchSize) {
+    const batch = files.slice(i, i + batchSize);
+    const batchNumber = Math.floor(i / batchSize) + 1;
+    const totalBatches = Math.ceil(total / batchSize);
+
+    broadcast("progress", {
+      message: `🔄 Processing batch ${batchNumber}/${totalBatches} (${batch.length} files)`,
+      progress: (i / total) * 100
     });
 
-    let issues = [];
-    
-    try {
-      const aiResult = await callGeminiAPI(file.content, file.language);
-      if (aiResult && aiResult.issues) {
-        broadcast("progress", {
-          message: `✅ Analyzed ${path.basename(file.path)}, found ${aiResult.issues.length} issues`,
-          progress,
-        });
-        issues = aiResult.issues;
+    const batchPromises = batch.map(async (file, index) => {
+      const fileNumber = i + index + 1;
+      const progress = ((fileNumber / total) * 100).toFixed(1);
+
+      broadcast("progress", { 
+        message: `🔍 [${fileNumber}/${total}] (${progress}%) Analyzing ${path.basename(file.path)}`, 
+        progress 
+      });
+
+      let issues = [];
+
+      try {
+        const aiResult = await callGeminiAPI(file.content, file.language);
+        if (aiResult && aiResult.issues) {
+          broadcast("progress", {
+            message: `✅ Analyzed ${path.basename(file.path)}, found ${aiResult.issues.length} issues`,
+            progress,
+          });
+          issues = aiResult.issues;
+        }
+      } catch (error) {
+        console.error(`Error analyzing ${file.path}:`, error);
+        issues = [{ 
+          line: 0, 
+          type: "error", 
+          message: "Analysis failed", 
+          suggestion: "Try again" 
+        }];
       }
-    } catch (error) {
-      console.error(`Error analyzing ${file.path}:`, error);
-      issues = [{ line: 0, type: "error", message: "Analysis failed", suggestion: "Try again" }];
-    }
-    
-    results.push({ 
-      file: file.path, 
-      language: file.language, 
-      issues 
+
+      processed++;
+      return { 
+        file: file.path, 
+        language: file.language, 
+        issues 
+      };
     });
+
+    // Wait for current batch to complete
+    const batchResults = await Promise.allSettled(batchPromises);
     
-    await delay(1000);
+    // Process batch results
+    batchResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        results.push(result.value);
+      } else {
+        const file = batch[index];
+        results.push({
+          file: file.path,
+          language: file.language,
+          issues: [{ 
+            line: 0, 
+            type: "error", 
+            message: "Batch analysis failed", 
+            suggestion: "Try again" 
+          }]
+        });
+      }
+    });
+
+    // Delay between batches to avoid rate limiting
+    if (i + batchSize < total) {
+      broadcast("progress", {
+        message: `⏳ Waiting before next batch...`,
+        progress: ((i + batchSize) / total) * 100
+      });
+      await delay(3000);
+    }
   }
 
+  broadcast("progress", { 
+    message: `🎉 Analysis complete! Processed ${processed}/${total} files successfully`, 
+    progress: 100 
+  });
   broadcast("end", { message: "🚀 Analysis complete." });
+  
   return results;
 }
 
@@ -296,7 +452,7 @@ app.post("/api/analyze/code", async (req, res) => {
   try {
     const { code, filename = "code.txt" } = req.body;
     if (!code) return res.status(400).json({ error: "No code provided" });
-    
+
     const language = detectLanguage(filename);
     const aiResponse = await callGeminiAPI(code, language !== "unknown" ? language : "javascript");
     res.json(aiResponse);
@@ -312,37 +468,42 @@ app.post("/api/upload", upload.array("files"), async (req, res) => {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: "No files uploaded" });
     }
-    
+
     const uploadId = Date.now().toString();
     const extractPath = path.join(EXTRACTED_PATH, uploadId);
     fs.mkdirSync(extractPath, { recursive: true });
-    
+
     for (const file of req.files) {
       const dest = path.join(extractPath, file.originalname);
       fs.renameSync(file.path, dest);
     }
-    
-    res.json({ success: true, uploadId });
+
+    res.json({ success: true, uploadId, fileCount: req.files.length });
   } catch (error) {
     console.error("Upload error:", error);
     res.status(500).json({ error: "Upload failed" });
   }
 });
 
-// Analyze uploaded folder
+// Analyze uploaded folder with batch processing
 app.post("/api/analyze/:uploadId", async (req, res) => {
   try {
     const { uploadId } = req.params;
+    const { batchSize = 5 } = req.body; // Allow client to specify batch size
     const extractPath = path.join(EXTRACTED_PATH, uploadId);
-    
+
     if (!fs.existsSync(extractPath)) {
       return res.status(400).json({ error: "Upload not found" });
     }
-    
+
     const files = readCodeFiles(extractPath);
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
-    
-    const aiResponse = await analyzeFiles(files);
+
+    broadcast("progress", {
+      message: `📊 Found ${files.length} code files. Starting batch analysis...`
+    });
+
+    const aiResponse = await analyzeFilesInBatches(files, parseInt(batchSize));
     res.json(aiResponse);
   } catch (error) {
     console.error("Analysis error:", error);
@@ -350,25 +511,29 @@ app.post("/api/analyze/:uploadId", async (req, res) => {
   }
 });
 
-// Upload & analyze directly
+// Upload & analyze directly with batch processing
 app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: "No files uploaded" });
     }
-    
+
     const extractPath = path.join(EXTRACTED_PATH, Date.now().toString());
     fs.mkdirSync(extractPath, { recursive: true });
-    
+
     for (const file of req.files) {
       const dest = path.join(extractPath, file.originalname);
       fs.renameSync(file.path, dest);
     }
-    
+
     const files = readCodeFiles(extractPath);
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
-    
-    const aiResponse = await analyzeFiles(files);
+
+    broadcast("progress", {
+      message: `📊 Found ${files.length} code files. Starting batch analysis...`
+    });
+
+    const aiResponse = await analyzeFilesInBatches(files, 5); // Default batch size 5
     res.json(aiResponse);
   } catch (error) {
     console.error("Upload analysis error:", error);
@@ -376,12 +541,14 @@ app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
   }
 });
 
+// ... (rest of your routes remain the same - GitHub analysis, health check, etc.)
+
 // Download & extract GitHub repo ZIP
 async function downloadRepoZip(repoUrl, extractPath, token = null) {
   try {
     const match = repoUrl.match(/github.com\/([^\/]+)\/([^\/]+)(?:\.git)?/);
     if (!match) throw new Error("Invalid GitHub URL");
-    
+
     const owner = match[1];
     const repo = match[2];
 
@@ -412,10 +579,10 @@ async function downloadRepoZip(repoUrl, extractPath, token = null) {
   }
 }
 
-// GitHub repo analysis
+// GitHub repo analysis with batch processing
 app.post("/analyze/github", async (req, res) => {
   try {
-    const { repoUrl, token } = req.body;
+    const { repoUrl, token, batchSize = 5 } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "Repository URL is required" });
 
     const repoPath = path.join(REPOS_PATH, Date.now().toString());    
@@ -429,16 +596,20 @@ app.post("/analyze/github", async (req, res) => {
     const subDirs = fs.readdirSync(repoPath).filter(item => 
       !item.endsWith('.zip') && fs.statSync(path.join(repoPath, item)).isDirectory()
     );
-    
+
     if (subDirs.length === 0) {
       return res.status(500).json({ error: "No extracted content found" });
     }
-    
+
     const extractedRoot = path.join(repoPath, subDirs[0]);    
     const files = readCodeFiles(extractedRoot);    
     if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });    
 
-    const aiResponse = await analyzeFiles(files);    
+    broadcast("progress", {
+      message: `📊 Found ${files.length} code files in repository. Starting batch analysis...`
+    });
+
+    const aiResponse = await analyzeFilesInBatches(files, parseInt(batchSize));    
     res.json(aiResponse);
   } catch (error) {
     console.error("GitHub analysis error:", error);
@@ -446,10 +617,34 @@ app.post("/analyze/github", async (req, res) => {
   }
 });
 
-// Health check
-app.get("/health", (req, res) =>
-  res.json({ status: "OK", message: "Server running" })
-);
+// Health check with API status
+app.get("/health", (req, res) => {
+  resetApiUsage();
+  res.json({ 
+    status: "OK", 
+    message: "Server running",
+    apiStatus: apiUsage.map((usage, index) => ({
+      api: index + 1,
+      requests: usage.requests,
+      errors: usage.errors,
+      lastReset: new Date(usage.lastReset).toISOString()
+    }))
+  });
+});
+
+// API status endpoint
+app.get("/api/status", (req, res) => {
+  resetApiUsage();
+  res.json({
+    totalApis: GEMINI_API_KEYS.length,
+    usage: apiUsage.map((usage, index) => ({
+      api: index + 1,
+      requests: usage.requests,
+      errors: usage.errors,
+      health: usage.errors > 10 ? "poor" : usage.errors > 5 ? "degraded" : "good"
+    }))
+  });
+});
 
 // Start server
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
