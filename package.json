@@ -21,6 +21,9 @@
     "globals": "^16.4.0",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
-    "simple-git": "^3.28.0"
+    "simple-git": "^3.28.0",
+"nodemailer": "^7.0.5",
+"mongoose": "^8.18.0"
+    
   }
 }
