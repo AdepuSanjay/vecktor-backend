@@ -1,17 +1,5 @@
-// server.mjs
-// Single-file Express server with:
-// - MongoDB (mongoose) connection
-// - Gmail App Password mailer (OTP sign-up)
-// - Signup (OTP) / Signin (password) with JWT
-// - Anonymous chat (ephemeral, not stored)
-// - Chat history storing and retrieval for signed-in users
-// - File upload + repository download + code analysis using your Gemini call
-// - File upload and analyze endpoints
-// - SSE progress broadcasting for analysis
-//
-// NOTE: This file intentionally inlines credentials (no .env) as requested.
-// Be careful with sharing this file publicly.
-
+// server.js  (single-file server - signup/signin with Gmail OTP, sessions, chat history + analysis)
+// Run: node server.js
 import express from "express";
 import multer from "multer";
 import AdmZip from "adm-zip";
@@ -21,10 +9,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import fetch from "node-fetch";
-import nodemailer from "nodemailer";
 import mongoose from "mongoose";
-import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
+import nodemailer from "nodemailer";
+import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -32,103 +19,12 @@ const __dirname = dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ------------------- CONFIG (no .env as requested) -------------------
-// MongoDB connection string (you provided earlier)
-const MONGO_URI =
-  process.env.MONGO_URI ||
-  "mongodb+srv://Abcd:123@cluster0.lc6c1xt.mongodb.net/study";
-
-// Gmail credentials (App Password)
-const MAIL_USER = "adepusanjay444@gmail.com";
-const MAIL_PASS = "lrnesuqvssiognej"; // App password you provided
-
-// JWT secret (since no env, keep here)
-const JWT_SECRET = "super-secret-key-no-env"; // change if you want
-
-// Gemini API key
-const GEMINI_API_KEY =
-  process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
-
-// Allowed origins for CORS
+// Allowed origins
 const ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "https://vektor-insight.vercel.app",
   "https://studymate-swart.vercel.app",
 ];
-
-// ------------------- MONGOOSE SETUP -------------------
-mongoose
-  .connect(MONGO_URI, { autoIndex: true })
-  .then(() => console.log("✅ MongoDB Connected"))
-  .catch((err) => console.error("❌ MongoDB Error:", err));
-
-// Schemas
-const UserSchema = new mongoose.Schema(
-  {
-    name: String,
-    email: { type: String, unique: true, index: true },
-    passwordHash: String, // bcrypt hash
-    createdAt: { type: Date, default: Date.now },
-  },
-  { timestamps: true }
-);
-
-const ChatMessageSchema = new mongoose.Schema(
-  {
-    role: { type: String, enum: ["user", "assistant", "system"], default: "user" },
-    content: String,
-    createdAt: { type: Date, default: Date.now },
-    // optionally link to analysis results or files
-    meta: mongoose.Schema.Types.Mixed,
-  },
-  { _id: false }
-);
-
-const ChatSchema = new mongoose.Schema(
-  {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-    title: String,
-    messages: [ChatMessageSchema],
-    createdAt: { type: Date, default: Date.now },
-    updatedAt: { type: Date, default: Date.now },
-    // analyze results or uploaded file refs
-    files: [mongoose.Schema.Types.Mixed],
-  },
-  { timestamps: true }
-);
-
-const User = mongoose.model("User", UserSchema);
-const Chat = mongoose.model("Chat", ChatSchema);
-
-// ------------------- MAILER (Gmail App Password) -------------------
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: MAIL_USER,
-    pass: MAIL_PASS,
-  },
-});
-
-// ------------------- STORAGE & UPLOADS -------------------
-const BASE_TMP = "/tmp";
-const UPLOADS_PATH = path.join(BASE_TMP, "uploads");
-const EXTRACTED_PATH = path.join(BASE_TMP, "extracted");
-const REPOS_PATH = path.join(BASE_TMP, "repos");
-[UPLOADS_PATH, EXTRACTED_PATH, REPOS_PATH].forEach((p) =>
-  fs.mkdirSync(p, { recursive: true })
-);
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_PATH);
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + "-" + file.originalname);
-  },
-});
-const upload = multer({ storage });
-
-// ------------------- CORS & MIDDLEWARE -------------------
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -140,14 +36,89 @@ app.use(
   })
 );
 
-app.use(express.json());
-app.use(express.static("public"));
+// ------------------- MONGOOSE -------------------
+mongoose
+  .connect(process.env.MONGO_URI || "mongodb+srv://Abcd:123@cluster0.lc6c1xt.mongodb.net/study")
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch((err) => console.error("❌ MongoDB Error:", err));
 
-// ------------------- HELPERS (from your file, lightly adapted) -------------------
+// Simple User and Chat Schemas (single file)
+const userSchema = new mongoose.Schema({
+  name: String,
+  email: { type: String, unique: true },
+  password: String, // plain text as requested (insecure - consider hashing later)
+  sessionToken: String, // active session token (simple)
+  createdAt: { type: Date, default: Date.now },
+});
+const User = mongoose.model("User", userSchema);
+
+const chatSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: false }, // null = anonymous
+  sessionId: String, // for anonymous session tracking
+  messages: [
+    {
+      role: String, // 'user' | 'assistant' | 'system'
+      text: String,
+      meta: Object,
+      createdAt: { type: Date, default: Date.now },
+    },
+  ],
+  createdAt: { type: Date, default: Date.now },
+});
+const Chat = mongoose.model("Chat", chatSchema);
+
+// ------------------- Mailer (Gmail App Password configured inline per request) -------------------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: "adepusanjay444@gmail.com",
+    pass: "lrnesuqvssiognej", // App Password (you provided it)
+  },
+});
+
+// ------------------- TEMP STORAGE -------------------
+// Temporary OTP store: { email: { otp, expiresAt, name, password } }
+const tempOtps = new Map();
+
+// Anonymous in-memory chats keyed by sessionId (ephemeral)
+const anonChats = new Map();
+
+// ------------------- PATHS -------------------
+const BASE_TMP = "/tmp";
+const UPLOADS_PATH = path.join(BASE_TMP, "uploads");
+const EXTRACTED_PATH = path.join(BASE_TMP, "extracted");
+const REPOS_PATH = path.join(BASE_TMP, "repos");
+[UPLOADS_PATH, EXTRACTED_PATH, REPOS_PATH].forEach((p) => fs.mkdirSync(p, { recursive: true }));
+
+// ------------------- MULTER -------------------
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, UPLOADS_PATH);
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + "-" + file.originalname);
+  },
+});
+const upload = multer({ storage });
+
+// ------------------- HELPERS -------------------
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function makeOTP() {
+  return (Math.floor(100000 + Math.random() * 900000)).toString(); // 6-digit
+}
+
+function makeToken() {
+  return crypto.randomBytes(28).toString("hex");
+}
+
+function nowPlusMinutes(min) {
+  return Date.now() + min * 60 * 1000;
+}
+
+// (existing helpers from your file)
 const LANGUAGE_EXTENSIONS = {
   python: [".py"],
   javascript: [".js", ".jsx"],
@@ -201,15 +172,7 @@ function shouldIgnoreFile(filename) {
 
 function readCodeFiles(dirPath) {
   const files = [];
-  const ignoreDirs = [
-    ".git",
-    "node_modules",
-    "vendor",
-    "dist",
-    "build",
-    "pycache",
-    "__pycache__",
-  ];
+  const ignoreDirs = [".git", "node_modules", "vendor", "dist", "build", "pycache", "__pycache__"];
   const ignoreFiles = [".DS_Store", "Thumbs.db"];
 
   function readRecursive(currentPath) {
@@ -233,9 +196,7 @@ function readCodeFiles(dirPath) {
             files.push({
               path: fullPath,
               content,
-              language: isDependencyFile(fullPath)
-                ? "dependency"
-                : detectLanguage(fullPath),
+              language: isDependencyFile(fullPath) ? "dependency" : detectLanguage(fullPath),
             });
           } catch {
             console.log(`Skipping file: ${fullPath}`);
@@ -249,7 +210,7 @@ function readCodeFiles(dirPath) {
   return files;
 }
 
-// ------------------- SSE (progress) -------------------
+// ------------------- SSE (unchanged) -------------------
 let clients = [];
 app.get("/progress", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
@@ -269,7 +230,9 @@ function broadcast(event, data) {
   });
 }
 
-// ------------------- Gemini / AI CALL -------------------
+// ------------------- GEMINI CALL (same as yours) -------------------
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCk3VyHVj3_UMqtHlN5NhbS5pv9yMHDSTs";
+
 async function callGeminiAPI(codeContent, language, retries = 3) {
   const prompt = `
 You are an expert code analyzer for ${language}.
@@ -283,7 +246,8 @@ Return ONLY valid JSON like this:
 }
 
 Types: syntax_error, dependency, duplicate, security, performance, best_practice
-Code:\n${codeContent}
+Code:
+${codeContent}
 `;
 
   for (let i = 0; i < retries; i++) {
@@ -327,7 +291,7 @@ Code:\n${codeContent}
   }
 }
 
-// ------------------- ANALYSIS -------------------
+// ------------------- ANALYSIS (unchanged but wired to save chat) -------------------
 async function analyzeFiles(files) {
   const results = [];
   const total = files.length;
@@ -376,7 +340,354 @@ async function analyzeFiles(files) {
   return results;
 }
 
-// ------------------- GITHUB DOWNLOAD -------------------
+// ------------------- AUTH HELPERS & MIDDLEWARE -------------------
+
+// Authenticate by session token header 'x-session-token'
+async function authMiddleware(req, res, next) {
+  const token = req.headers["x-session-token"];
+  if (!token) {
+    req.user = null;
+    return next();
+  }
+  const user = await User.findOne({ sessionToken: token });
+  if (!user) {
+    req.user = null;
+    return next();
+  }
+  req.user = user;
+  next();
+}
+
+app.use(express.json());
+app.use(express.static("public"));
+app.use(authMiddleware);
+
+// ------------------- AUTH ROUTES (OTP-based) -------------------
+
+// 1) Signup request: generate OTP and email it. Body: { name, email, password }
+app.post("/auth/signup/request", async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ error: "Missing fields" });
+
+    // If user already exists -> return error
+    const existing = await User.findOne({ email });
+    if (existing) return res.status(400).json({ error: "Email already registered" });
+
+    const otp = makeOTP();
+    const expiresAt = nowPlusMinutes(10); // 10 minutes
+
+    tempOtps.set(email, { otp, expiresAt, name, password });
+
+    // send mail
+    await transporter.sendMail({
+      to: email,
+      subject: "Your signup OTP",
+      text: `Your signup OTP is: ${otp}. It expires in 10 minutes.`,
+    });
+
+    return res.json({ success: true, message: "OTP sent to email" });
+  } catch (err) {
+    console.error("Signup request error:", err);
+    res.status(500).json({ error: "Unable to send OTP" });
+  }
+});
+
+// 2) Signup verify: Body { email, otp } -> create user
+app.post("/auth/signup/verify", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ error: "Missing fields" });
+
+    const record = tempOtps.get(email);
+    if (!record) return res.status(400).json({ error: "No OTP request found" });
+    if (Date.now() > record.expiresAt) {
+      tempOtps.delete(email);
+      return res.status(400).json({ error: "OTP expired" });
+    }
+    if (record.otp !== otp) return res.status(400).json({ error: "Invalid OTP" });
+
+    // create user
+    const user = new User({
+      name: record.name,
+      email,
+      password: record.password, // plain text per request
+      sessionToken: makeToken(),
+    });
+    await user.save();
+    tempOtps.delete(email);
+
+    return res.json({ success: true, token: user.sessionToken, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    console.error("Signup verify error:", err);
+    res.status(500).json({ error: "Signup failed" });
+  }
+});
+
+// 3) Signin request: Body { email, password } -> verify credentials then send OTP for signin
+app.post("/auth/signin/request", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Missing fields" });
+
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ error: "User not found" });
+    if (user.password !== password) return res.status(400).json({ error: "Invalid password" });
+
+    const otp = makeOTP();
+    const expiresAt = nowPlusMinutes(10);
+
+    tempOtps.set(email, { otp, expiresAt, signin: true }); // signin marker
+
+    await transporter.sendMail({
+      to: email,
+      subject: "Your signin OTP",
+      text: `Your signin OTP is: ${otp}. It expires in 10 minutes.`,
+    });
+
+    return res.json({ success: true, message: "Signin OTP sent" });
+  } catch (err) {
+    console.error("Signin request error:", err);
+    res.status(500).json({ error: "Unable to send OTP" });
+  }
+});
+
+// 4) Signin verify: Body { email, otp } -> issue session token
+app.post("/auth/signin/verify", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ error: "Missing fields" });
+
+    const record = tempOtps.get(email);
+    if (!record || !record.signin) return res.status(400).json({ error: "No signin OTP found" });
+    if (Date.now() > record.expiresAt) {
+      tempOtps.delete(email);
+      return res.status(400).json({ error: "OTP expired" });
+    }
+    if (record.otp !== otp) return res.status(400).json({ error: "Invalid OTP" });
+
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ error: "User not found" });
+
+    user.sessionToken = makeToken();
+    await user.save();
+
+    tempOtps.delete(email);
+    return res.json({ success: true, token: user.sessionToken, user: { id: user._id, name: user.name, email: user.email } });
+  } catch (err) {
+    console.error("Signin verify error:", err);
+    res.status(500).json({ error: "Signin failed" });
+  }
+});
+
+// Signout
+app.post("/auth/signout", async (req, res) => {
+  try {
+    const token = req.headers["x-session-token"];
+    if (!token) return res.status(400).json({ error: "Missing token" });
+    const user = await User.findOne({ sessionToken: token });
+    if (!user) return res.status(400).json({ error: "Invalid token" });
+    user.sessionToken = null;
+    await user.save();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Signout error:", err);
+    res.status(500).json({ error: "Signout failed" });
+  }
+});
+
+// ------------------- CHAT HISTORY ROUTES -------------------
+
+// Create or append a chat message (user sends message) and optionally get assistant response saved.
+// Body: { sessionId (optional for anonymous), text, meta (optional) }
+// If authenticated (x-session-token header), will store under user._id
+app.post("/chat/message", async (req, res) => {
+  try {
+    const { sessionId, text, meta } = req.body;
+    if (!text) return res.status(400).json({ error: "No text provided" });
+
+    let chatDoc = null;
+    if (req.user) {
+      // find or create chat for user
+      chatDoc = await Chat.findOne({ userId: req.user._id });
+      if (!chatDoc) {
+        chatDoc = new Chat({ userId: req.user._id, messages: [] });
+      }
+    } else {
+      // anonymous: must have or get a sessionId from client. If none provided, create one and return to client.
+      let sid = sessionId;
+      if (!sid) {
+        sid = makeToken();
+      }
+      // keep ephemeral in-memory chat list, and also persist a little to DB if desired (here we store in DB with sessionId)
+      chatDoc = await Chat.findOne({ sessionId: sid });
+      if (!chatDoc) {
+        chatDoc = new Chat({ sessionId: sid, messages: [] });
+      }
+      // ensure client knows sessionId
+      req.sessionId = sid;
+    }
+
+    // append user's message
+    chatDoc.messages.push({ role: "user", text, meta: meta || {}, createdAt: new Date() });
+    await chatDoc.save();
+
+    // NOTE: You can call Gemini/OpenAI here to generate assistant reply. For now we'll do a minimal assistant reply:
+    // We'll call callGeminiAPI as a "chat helper" only if needed. For demonstration, make a simple echo response.
+    const assistantText = `Received your message (${text.length} chars). Use /api/analyze endpoints to analyze code/files.`;
+
+    chatDoc.messages.push({ role: "assistant", text: assistantText, meta: { generated: true }, createdAt: new Date() });
+    await chatDoc.save();
+
+    const resp = { success: true, assistant: assistantText };
+    if (!req.user) resp.sessionId = req.sessionId || sessionId;
+    res.json(resp);
+  } catch (err) {
+    console.error("chat/message error:", err);
+    res.status(500).json({ error: "Chat failed" });
+  }
+});
+
+// Get chat history for authenticated user or anonymous session.
+// Query param: ?sessionId=xxx  (for anonymous)
+app.get("/chat/history", async (req, res) => {
+  try {
+    if (req.user) {
+      const chats = await Chat.find({ userId: req.user._id }).sort({ createdAt: -1 }).limit(50);
+      return res.json({ success: true, chats });
+    }
+    const sessionId = req.query.sessionId;
+    if (!sessionId) return res.status(400).json({ error: "No sessionId provided for anonymous user" });
+    const chat = await Chat.findOne({ sessionId });
+    return res.json({ success: true, chats: chat ? [chat] : [] });
+  } catch (err) {
+    console.error("chat/history error:", err);
+    res.status(500).json({ error: "Failed to fetch chats" });
+  }
+});
+
+// ------------------- UPLOAD & ANALYZE (w/ chat saving) -------------------
+
+// Upload only
+app.post("/api/upload", upload.array("files"), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const uploadId = Date.now().toString();
+    const extractPath = path.join(EXTRACTED_PATH, uploadId);
+    fs.mkdirSync(extractPath, { recursive: true });
+
+    for (const file of req.files) {
+      const dest = path.join(extractPath, file.originalname);
+      fs.renameSync(file.path, dest);
+    }
+
+    res.json({ success: true, uploadId });
+  } catch (error) {
+    console.error("Upload error:", error);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+// Analyze uploaded folder (store analysis in chat history)
+app.post("/api/analyze/:uploadId", async (req, res) => {
+  try {
+    const { uploadId } = req.params;
+    const extractPath = path.join(EXTRACTED_PATH, uploadId);
+
+    if (!fs.existsSync(extractPath)) {
+      return res.status(400).json({ error: "Upload not found" });
+    }
+
+    const files = readCodeFiles(extractPath);
+    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
+
+    const aiResponse = await analyzeFiles(files);
+
+    // Save analysis as chat message
+    let chatDoc;
+    if (req.user) {
+      chatDoc = await Chat.findOne({ userId: req.user._id });
+      if (!chatDoc) chatDoc = new Chat({ userId: req.user._id, messages: [] });
+    } else {
+      const sessionId = req.body.sessionId || req.query.sessionId;
+      if (!sessionId) {
+        // create ephemeral sessionId and send to client
+        const sid = makeToken();
+        chatDoc = new Chat({ sessionId: sid, messages: [] });
+      } else {
+        chatDoc = await Chat.findOne({ sessionId }) || new Chat({ sessionId, messages: [] });
+      }
+    }
+
+    chatDoc.messages.push({
+      role: "assistant",
+      text: "Analysis results",
+      meta: { analysis: aiResponse },
+      createdAt: new Date(),
+    });
+    await chatDoc.save();
+
+    res.json({ success: true, analysis: aiResponse });
+  } catch (error) {
+    console.error("Analysis error:", error);
+    res.status(500).json({ error: "Analysis failed" });
+  }
+});
+
+// Upload & analyze directly (store in chat)
+app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    const extractPath = path.join(EXTRACTED_PATH, Date.now().toString());
+    fs.mkdirSync(extractPath, { recursive: true });
+
+    for (const file of req.files) {
+      const dest = path.join(extractPath, file.originalname);
+      fs.renameSync(file.path, dest);
+    }
+
+    const files = readCodeFiles(extractPath);
+    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
+
+    const aiResponse = await analyzeFiles(files);
+
+    // Save analysis as chat message
+    let chatDoc;
+    if (req.user) {
+      chatDoc = await Chat.findOne({ userId: req.user._id });
+      if (!chatDoc) chatDoc = new Chat({ userId: req.user._id, messages: [] });
+    } else {
+      const sessionId = req.body.sessionId;
+      if (!sessionId) {
+        const sid = makeToken();
+        chatDoc = new Chat({ sessionId: sid, messages: [] });
+      } else {
+        chatDoc = await Chat.findOne({ sessionId }) || new Chat({ sessionId, messages: [] });
+      }
+    }
+
+    chatDoc.messages.push({
+      role: "assistant",
+      text: "Analysis results",
+      meta: { analysis: aiResponse },
+      createdAt: new Date(),
+    });
+    await chatDoc.save();
+
+    res.json({ success: true, analysis: aiResponse });
+  } catch (error) {
+    console.error("Upload analysis error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ------------------- GITHUB ZIP ANALYSIS (unchanged but chat-saved) -------------------
 async function downloadRepoZip(repoUrl, extractPath, token = null) {
   try {
     const match = repoUrl.match(/github.com\/([^\/]+)\/([^\/]+)(?:\.git)?/);
@@ -412,429 +723,6 @@ async function downloadRepoZip(repoUrl, extractPath, token = null) {
   }
 }
 
-// ------------------- AUTH: OTP + SIGNIN -------------------
-
-// In-memory OTP store: { email => { otp, name, passwordHash, expiresAt } }
-// We store passwordHash on initial step because user enters name/email/password then we send OTP
-const otpStore = new Map();
-
-// Helper: send OTP email
-async function sendOTPEmail(email, otp) {
-  const mailOptions = {
-    from: `StudyMate <${MAIL_USER}>`,
-    to: email,
-    subject: "Your StudyMate signup OTP",
-    text: `Your OTP for signup: ${otp}\nIt expires in 5 minutes.`,
-  };
-  return transporter.sendMail(mailOptions);
-}
-
-// Generate 6-digit OTP
-function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// Hash utility
-async function hashPassword(plain) {
-  const saltRounds = 10;
-  return bcrypt.hash(plain, saltRounds);
-}
-
-// JWT utilities
-function signJwt(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
-}
-
-function verifyJwt(token) {
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch {
-    return null;
-  }
-}
-
-// Auth middleware
-async function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-  const data = verifyJwt(token);
-  if (!data || !data.id) return res.status(401).json({ error: "Invalid token" });
-  req.userId = data.id;
-  next();
-}
-
-// ------------------- ROUTES: AUTH -------------------
-
-// Step 1: send OTP (user provides name, email, password)
-app.post("/auth/send-otp", async (req, res) => {
-  try {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: "name, email, password required" });
-    }
-
-    // check if user exists already
-    const existing = await User.findOne({ email });
-    if (existing) {
-      return res.status(400).json({ error: "User already exists. Please sign in." });
-    }
-
-    const otp = generateOTP();
-    const passwordHash = await hashPassword(password);
-
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
-    otpStore.set(email, { otp, name, passwordHash, expiresAt });
-
-    // send email
-    try {
-      await sendOTPEmail(email, otp);
-      return res.json({ ok: true, message: "OTP sent to email (valid 5 minutes)" });
-    } catch (err) {
-      console.error("Failed to send OTP email:", err);
-      return res.status(500).json({ error: "Failed to send OTP email" });
-    }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Step 2: verify OTP and create user
-app.post("/auth/verify-otp", async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    if (!email || !otp) return res.status(400).json({ error: "email and otp required" });
-
-    const record = otpStore.get(email);
-    if (!record) return res.status(400).json({ error: "No OTP requested for this email" });
-
-    if (Date.now() > record.expiresAt) {
-      otpStore.delete(email);
-      return res.status(400).json({ error: "OTP expired" });
-    }
-    if (record.otp !== String(otp)) return res.status(400).json({ error: "Invalid OTP" });
-
-    // Create user
-    const user = new User({
-      name: record.name,
-      email,
-      passwordHash: record.passwordHash,
-    });
-    await user.save();
-
-    // cleanup otp
-    otpStore.delete(email);
-
-    // return jwt
-    const token = signJwt({ id: user._id, email: user.email });
-    res.json({ ok: true, token, user: { id: user._id, name: user.name, email: user.email } });
-  } catch (err) {
-    console.error("verify-otp error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Signin: email + password
-app.post("/auth/signin", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "email and password required" });
-
-    const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ error: "Invalid credentials" });
-
-    const ok = await bcrypt.compare(password, user.passwordHash);
-    if (!ok) return res.status(400).json({ error: "Invalid credentials" });
-
-    const token = signJwt({ id: user._id, email: user.email });
-    res.json({ ok: true, token, user: { id: user._id, name: user.name, email: user.email } });
-  } catch (err) {
-    console.error("signin error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ------------------- CHAT: send message / history -------------------
-
-// Send a chat message (and optionally save to DB if authenticated).
-// Body: { message: "text", anon: boolean (optional), chatId: string (optional) }
-// If anon=true or no token provided -> ephemeral (not stored).
-app.post("/chat/send", async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const userData = token ? verifyJwt(token) : null;
-
-    const { message, anon = false, chatId } = req.body;
-    if (!message) return res.status(400).json({ error: "message required" });
-
-    // Here you'd call your chat model / logic. For now we simulate AI assistant reply
-    // Optionally you could call Gemini / other model for actual responses. We'll return a simple echo + analysis placeholder.
-
-    // Example: analyze the message for code blocks (very naive)
-    const containsCode = /```[\s\S]*?```/.test(message) || /function\s+\w+\(/.test(message);
-    const assistantReply = containsCode
-      ? `I detected code in your message. You can use /api/analyze/code or upload files for in-depth analysis.`
-      : `Assistant reply: ${message}`;
-
-    const msgUser = { role: "user", content: message, createdAt: new Date() };
-    const msgAssistant = { role: "assistant", content: assistantReply, createdAt: new Date() };
-
-    // If anonymous or not authenticated -> don't save, just return ephemeral exchange
-    if (anon || !userData) {
-      return res.json({
-        ok: true,
-        saved: false,
-        conversation: [msgUser, msgAssistant],
-      });
-    }
-
-    // Authenticated: store into a chat document (create new or append)
-    const userId = userData.id;
-    let chat;
-    if (chatId) {
-      chat = await Chat.findOne({ _id: chatId, userId });
-    }
-
-    if (!chat) {
-      chat = new Chat({
-        userId,
-        title: message.slice(0, 60),
-        messages: [msgUser, msgAssistant],
-        files: [],
-      });
-    } else {
-      chat.messages.push(msgUser);
-      chat.messages.push(msgAssistant);
-      chat.updatedAt = new Date();
-    }
-    await chat.save();
-
-    res.json({
-      ok: true,
-      saved: true,
-      chatId: chat._id,
-      conversation: [msgUser, msgAssistant],
-    });
-  } catch (err) {
-    console.error("/chat/send error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Get chat history for authenticated user (list chats)
-app.get("/chat/history", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const chats = await Chat.find({ userId }).sort({ updatedAt: -1 }).limit(100);
-    res.json({ ok: true, chats });
-  } catch (err) {
-    console.error("chat/history error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Get single chat by id (must belong to user)
-app.get("/chat/:id", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.userId;
-    const chat = await Chat.findOne({ _id: req.params.id, userId });
-    if (!chat) return res.status(404).json({ error: "Chat not found" });
-    res.json({ ok: true, chat });
-  } catch (err) {
-    console.error("chat/:id error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Clear a user's chats
-app.delete("/chat/clear", authMiddleware, async (req, res) => {
-  try {
-    const userId = req.userId;
-    await Chat.deleteMany({ userId });
-    res.json({ ok: true, message: "All chats cleared" });
-  } catch (err) {
-    console.error("chat/clear error:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// ------------------- ANALYSIS & UPLOAD ENDPOINTS -------------------
-// These reuse your logic. If a request is authenticated -> results are stored in the user's chat record.
-// Otherwise they run but do not persist (anon usage).
-
-// Analyze direct code snippet
-app.post("/api/analyze/code", async (req, res) => {
-  try {
-    const { code, filename = "code.txt", saveToChat = false, chatId = null } = req.body;
-    if (!code) return res.status(400).json({ error: "No code provided" });
-
-    const language = detectLanguage(filename);
-    const aiResponse = await callGeminiAPI(code, language !== "unknown" ? language : "javascript");
-
-    // If user is authenticated and saveToChat true -> append to chat
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const userData = token ? verifyJwt(token) : null;
-
-    if (userData && saveToChat) {
-      const userId = userData.id;
-      let chat = null;
-      if (chatId) chat = await Chat.findOne({ _id: chatId, userId });
-      if (!chat) {
-        chat = new Chat({
-          userId,
-          title: filename,
-          messages: [
-            { role: "user", content: `Analyze code: ${filename}`, createdAt: new Date() },
-            { role: "assistant", content: JSON.stringify(aiResponse, null, 2), createdAt: new Date(), meta: { filename } },
-          ],
-          files: [],
-        });
-      } else {
-        chat.messages.push({ role: "user", content: `Analyze code: ${filename}`, createdAt: new Date() });
-        chat.messages.push({ role: "assistant", content: JSON.stringify(aiResponse, null, 2), createdAt: new Date(), meta: { filename } });
-        chat.updatedAt = new Date();
-      }
-      await chat.save();
-      return res.json({ ok: true, saved: true, aiResponse, chatId: chat._id });
-    }
-
-    res.json({ ok: true, saved: false, aiResponse });
-  } catch (error) {
-    console.error("Code analysis error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// Upload files (store files temporarily) - returns uploadId
-app.post("/api/upload", upload.array("files"), async (req, res) => {
-  try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ error: "No files uploaded" });
-    }
-
-    const uploadId = Date.now().toString();
-    const extractPath = path.join(EXTRACTED_PATH, uploadId);
-    fs.mkdirSync(extractPath, { recursive: true });
-
-    for (const file of req.files) {
-      const dest = path.join(extractPath, file.originalname);
-      fs.renameSync(file.path, dest);
-    }
-
-    res.json({ success: true, uploadId });
-  } catch (error) {
-    console.error("Upload error:", error);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-// Analyze uploaded folder (by uploadId) - if authenticated, saved to user's chat if saveToChat true
-app.post("/api/analyze/:uploadId", async (req, res) => {
-  try {
-    const { uploadId } = req.params;
-    const { saveToChat = false, chatId = null } = req.body;
-    const extractPath = path.join(EXTRACTED_PATH, uploadId);
-
-    if (!fs.existsSync(extractPath)) {
-      return res.status(400).json({ error: "Upload not found" });
-    }
-
-    const files = readCodeFiles(extractPath);
-    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
-
-    const aiResponse = await analyzeFiles(files);
-
-    // If authenticated and saveToChat -> save result summary
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const userData = token ? verifyJwt(token) : null;
-
-    if (userData && saveToChat) {
-      const userId = userData.id;
-      let chat = null;
-      if (chatId) chat = await Chat.findOne({ _id: chatId, userId });
-      const summary = { uploadId, fileCount: files.length, analyzedAt: new Date() };
-      if (!chat) {
-        chat = new Chat({
-          userId,
-          title: `Analysis ${new Date().toISOString()}`,
-          messages: [
-            { role: "user", content: `Uploaded files: ${uploadId}`, createdAt: new Date() },
-            { role: "assistant", content: "Analysis results attached", createdAt: new Date(), meta: { summary } },
-          ],
-          files: aiResponse,
-        });
-      } else {
-        chat.messages.push({ role: "user", content: `Uploaded files: ${uploadId}`, createdAt: new Date() });
-        chat.messages.push({ role: "assistant", content: "Analysis results attached", createdAt: new Date(), meta: { summary } });
-        chat.files = chat.files.concat(aiResponse);
-        chat.updatedAt = new Date();
-      }
-      await chat.save();
-      return res.json({ ok: true, saved: true, aiResponse, chatId: chat._id });
-    }
-
-    res.json({ ok: true, saved: false, aiResponse });
-  } catch (error) {
-    console.error("Analysis error:", error);
-    res.status(500).json({ error: "Analysis failed" });
-  }
-});
-
-// Upload & analyze directly (upload + analyze in one)
-app.post("/api/analyze/upload", upload.array("files"), async (req, res) => {
-  try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ error: "No files uploaded" });
-    }
-
-    const extractPath = path.join(EXTRACTED_PATH, Date.now().toString());
-    fs.mkdirSync(extractPath, { recursive: true });
-
-    for (const file of req.files) {
-      const dest = path.join(extractPath, file.originalname);
-      fs.renameSync(file.path, dest);
-    }
-
-    const files = readCodeFiles(extractPath);
-    if (files.length === 0) return res.status(400).json({ error: "No relevant files found" });
-
-    const aiResponse = await analyzeFiles(files);
-
-    // Save summary if authenticated & requested via header
-    const saveToChatHeader = (req.headers["x-save-to-chat"] || "").toString().toLowerCase();
-    const saveToChat = saveToChatHeader === "true";
-
-    const authHeader = req.headers.authorization || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const userData = token ? verifyJwt(token) : null;
-
-    if (userData && saveToChat) {
-      const userId = userData.id;
-      const chat = new Chat({
-        userId,
-        title: `Upload Analysis ${new Date().toISOString()}`,
-        messages: [
-          { role: "user", content: `Uploaded files`, createdAt: new Date() },
-          { role: "assistant", content: "Analysis results attached", createdAt: new Date() },
-        ],
-        files: aiResponse,
-      });
-      await chat.save();
-      return res.json({ ok: true, saved: true, aiResponse, chatId: chat._id });
-    }
-
-    res.json({ ok: true, saved: false, aiResponse });
-  } catch (error) {
-    console.error("Upload analysis error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// GitHub repo analysis
 app.post("/analyze/github", async (req, res) => {
   try {
     const { repoUrl, token } = req.body;
@@ -861,29 +749,19 @@ app.post("/analyze/github", async (req, res) => {
 
     const aiResponse = await analyzeFiles(files);
 
-    // Save if authenticated and requested via header
-    const saveToChatHeader = (req.headers["x-save-to-chat"] || "").toString().toLowerCase();
-    const saveToChat = saveToChatHeader === "true";
-    const authHeader = req.headers.authorization || "";
-    const tkn = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const userData = tkn ? verifyJwt(tkn) : null;
-
-    if (userData && saveToChat) {
-      const userId = userData.id;
-      const chat = new Chat({
-        userId,
-        title: `GitHub Analysis ${repoUrl}`,
-        messages: [
-          { role: "user", content: `Analyze repo: ${repoUrl}`, createdAt: new Date() },
-          { role: "assistant", content: "Analysis results attached", createdAt: new Date() },
-        ],
-        files: aiResponse,
-      });
-      await chat.save();
-      return res.json({ ok: true, saved: true, aiResponse, chatId: chat._id });
+    // Save to chat
+    let chatDoc;
+    if (req.user) {
+      chatDoc = await Chat.findOne({ userId: req.user._id }) || new Chat({ userId: req.user._id, messages: [] });
+    } else {
+      const sessionId = req.body.sessionId;
+      chatDoc = (sessionId && (await Chat.findOne({ sessionId }))) || new Chat({ sessionId, messages: [] });
+      if (!chatDoc) chatDoc = new Chat({ sessionId, messages: [] });
     }
+    chatDoc.messages.push({ role: "assistant", text: "GitHub analysis results", meta: { analysis: aiResponse }, createdAt: new Date() });
+    await chatDoc.save();
 
-    res.json({ ok: true, saved: false, aiResponse });
+    res.json({ success: true, analysis: aiResponse });
   } catch (error) {
     console.error("GitHub analysis error:", error);
     res.status(500).json({ error: "Internal server error" });
